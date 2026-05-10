@@ -10,11 +10,14 @@ It quickly grew past that. What started as an MSU-1 listener turned into a full 
 
 ## Features
 
-- Modern dark **deep-blue** UI (PySide6 / Qt 6) with custom waveform display
+- Modern dark UI (PySide6 / Qt 6) with custom waveform display and **brushed-metal transport buttons**
+- **Switchable themes** — gear icon in the header opens a picker with **Ocean** (deep blue, default), **Forest** (emerald green), **Sunset** (warm orange) and **Graphite** (black/gray); the selection is remembered in a portable `settings.json` next to the .exe (no registry, no AppData — fully portable)
+- **In-app context-menu install** — same gear menu offers a one-click "Install in Windows right-click menu" / "Remove from Windows right-click menu" toggle (auto-detects the current state, no admin required)
 - Drag-and-drop anywhere on the window — adds files to the playlist
+- **Auto-play on launch:** opening a file via association or sending one through the right-click context menu starts playback immediately
 - Click-to-seek waveform display
-- Full transport: **Play / Pause / Stop / Previous / Next** + 5-second skip buttons
-- **Real-time playback speed** slider (0.50× – 2.50×, double-click to reset)
+- Full transport: **Play / Pause / Stop / Previous / Next**
+- **Real-time playback speed**: stepwise `−` / `+` buttons (0.05× per click, range 0.50× – 2.50×) plus a one-click reset to 1.00×
 - Volume slider (defaults to 100 %)
 - Animated bevel-style transport buttons with press feedback
 - Playlist with auto-advance, double-click to jump, add/remove/clear
@@ -55,6 +58,18 @@ MSU-1 `.pcm` files use this format:
 - **Pre-data bytes:** 8 (the `"MSU1"` magic + 4-byte loop point)
 
 Drop the `.pcm` file in and it plays — the auto-detected format already matches MSU-1. The 8 leading metadata bytes will produce a tiny click at the very start of the track since the player auto-detects parameters and doesn't expose a header-skip field. If that bothers you, strip the first 8 bytes from the file (`tail -c +9 in.pcm > out.pcm` or any hex editor).
+
+## Right-click "Play with PCM-Player" (Windows)
+
+You can register the player as a Windows Explorer right-click action so that selecting one or more audio files and choosing **Play with PCM-Player** sends them all as a playlist to the running player.
+
+**Easiest way (in-app):** open the gear menu → click **"Install in Windows right-click menu"**. The same menu auto-detects the current state and toggles to **"Remove from Windows right-click menu"** if it's already installed. Per-user only (`HKCU`), no admin required.
+
+**Alternative (.bat files):** if you'd rather not open the player, the repo also ships `install_context_menu.bat` / `uninstall_context_menu.bat`. Drop them next to `PCMPlayer.exe` and double-click — same end result.
+
+The verb uses `MultiSelectModel="Player"`, which tells Explorer to invoke the player **once** with all selected files as arguments — they show up as a playlist and the first one starts playing immediately.
+
+If you move `PCMPlayer.exe` to a new location, re-install (gear menu or `.bat`) from there so the registered path stays correct.
 
 ## Keyboard shortcuts
 
@@ -122,11 +137,14 @@ pyinstaller --noconfirm --clean --onefile --windowed \
 
 ```
 pcmplayer/
-├── pcm_player.py        # Application (single file)
-├── requirements.txt     # Python dependencies
-├── build_windows.bat    # Windows build script
-├── icon.ico             # Multi-resolution Windows icon (embedded in the .exe)
-└── README.md            # This file
+├── pcm_player.py                  # Application (single file)
+├── requirements.txt               # Python dependencies
+├── build_windows.bat              # Windows build script
+├── install_context_menu.bat       # Adds "Play with PCM-Player" to Explorer right-click
+├── uninstall_context_menu.bat     # Removes it
+├── icon.ico                       # Multi-resolution Windows icon (embedded in the .exe)
+├── CHANGELOG.md                   # Per-version release notes
+└── README.md                      # This file
 ```
 
 ## Technical notes
@@ -139,6 +157,8 @@ pcmplayer/
 - **Seeking** is seamless: the stream is closed, the frame cursor is repositioned, the stream is reopened. On modern hardware it's imperceptible.
 - **Crash safety:** `faulthandler` and `sys.excepthook` write a log file next to the executable on either Python exceptions or native (C-extension) faults — important because the packaged build runs `--windowed` and would otherwise die silently. The log is auto-purged on a clean exit.
 - **Windows taskbar identity:** `SetCurrentProcessExplicitAppUserModelID` is called early so the taskbar groups under the PCM Player icon instead of the generic Python interpreter icon.
+- **Portable settings:** the chosen theme is written to `settings.json` next to the executable. No registry keys, no AppData — copy the `.exe` and its `settings.json` to a USB stick and your preference travels with it.
+- **Context-menu install** uses the Python `winreg` module to write `HKCU\Software\Classes\*\shell\PlayWithPCMPlayer` with `MultiSelectModel=Player`. The gear menu's `aboutToShow` signal re-checks the registry each time it's opened so the install/uninstall label stays in sync.
 
 ## License
 

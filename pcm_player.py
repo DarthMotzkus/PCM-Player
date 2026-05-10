@@ -20,6 +20,7 @@ Shortcuts: Space (play/pause), Left/Right (seek 5s), Shift+Left/Right (jump),
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 import atexit
@@ -85,13 +86,96 @@ def _resource_path(name: str) -> str:
     return os.path.join(base, name)
 
 
+def _settings_path() -> str:
+    """Path to the portable settings.json — always next to the .exe (frozen)
+    or next to the script (dev)."""
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "settings.json")
+
+
+def _load_settings() -> dict:
+    try:
+        with open(_settings_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_settings(data: dict) -> None:
+    try:
+        with open(_settings_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------------------------------
+# Windows right-click "Play with PCM-Player" — install/uninstall via winreg.
+# Per-user (HKCU), no admin required. Multi-select aware via MultiSelectModel.
+# -----------------------------------------------------------------------------
+
+_CTXMENU_KEY = r"Software\Classes\*\shell\PlayWithPCMPlayer"
+
+
+def _ctxmenu_supported() -> bool:
+    """Only available on Windows when the player is running as a packaged .exe."""
+    return sys.platform == "win32" and getattr(sys, "frozen", False)
+
+
+def _ctxmenu_is_installed() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _CTXMENU_KEY):
+            return True
+    except (OSError, FileNotFoundError):
+        return False
+
+
+def _ctxmenu_install() -> bool:
+    if not _ctxmenu_supported():
+        return False
+    try:
+        import winreg
+        exe = sys.executable
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _CTXMENU_KEY) as k:
+            winreg.SetValue(k, "", winreg.REG_SZ, "Play with PCM-Player")
+            winreg.SetValueEx(k, "Icon", 0, winreg.REG_SZ, f'"{exe}",0')
+            winreg.SetValueEx(k, "MultiSelectModel", 0, winreg.REG_SZ, "Player")
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _CTXMENU_KEY + r"\command") as k:
+            winreg.SetValue(k, "", winreg.REG_SZ, f'"{exe}" %1')
+        return True
+    except Exception:
+        return False
+
+
+def _ctxmenu_uninstall() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _CTXMENU_KEY + r"\command")
+        except FileNotFoundError:
+            pass
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _CTXMENU_KEY)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
+from string import Template
+
 from PySide6.QtCore import (
-    QPoint, QPointF, QPropertyAnimation, QRect, QSize, Qt, QTimer, QUrl,
-    Signal, QObject, QEvent, QEasingCurve,
+    QPoint, QPointF, QPropertyAnimation, QRect, QSize, Qt,
+    QTimer, QUrl, Signal, QObject, QEvent, QEasingCurve,
 )
 from PySide6.QtGui import (
     QAction, QBrush, QColor, QDragEnterEvent, QDropEvent, QFont,
@@ -101,7 +185,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QGraphicsDropShadowEffect,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPushButton, QSizePolicy, QSlider,
+    QMenu, QMessageBox, QPushButton, QSizePolicy, QSlider,
     QStyleFactory, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -533,6 +617,20 @@ class WaveformWidget(QWidget):
         self._position: float = 0.0
         self._loading = False
         self._empty_text = "NO FILE LOADED"
+        self.apply_theme(THEMES[DEFAULT_THEME])
+
+    def apply_theme(self, t: dict):
+        self._wf_bg_top = QColor(t["drop_bg_top"])
+        self._wf_bg_bot = QColor(t["drop_bg_bot"])
+        self._wf_border = QColor(t["border"])
+        self._wf_played = QColor(t["accent"])
+        self._wf_unplayed = QColor(t["text_label"])
+        self._wf_unplayed.setAlpha(70)
+        self._wf_playhead = QColor(t["accent_glow"])
+        self._wf_text = QColor(t["text_label"])
+        self._wf_centerline = QColor(t["text_mute"])
+        self._wf_centerline.setAlpha(40)
+        self.update()
 
     def set_loading(self, loading: bool):
         self._loading = loading
@@ -560,18 +658,18 @@ class WaveformWidget(QWidget):
         # Background card with subtle vertical gradient
         from PySide6.QtGui import QLinearGradient
         bg = QLinearGradient(0, 0, 0, h)
-        bg.setColorAt(0.0, QColor("#102542"))
-        bg.setColorAt(1.0, QColor("#0B1C30"))
+        bg.setColorAt(0.0, self._wf_bg_top)
+        bg.setColorAt(1.0, self._wf_bg_bot)
         p.fillRect(self.rect(), bg)
-        p.setPen(QPen(QColor("#1E3A5F"), 1))
+        p.setPen(QPen(self._wf_border, 1))
         p.drawRect(0, 0, w - 1, h - 1)
 
         # Centerline
-        p.setPen(QPen(QColor(80, 150, 200, 40), 1))
+        p.setPen(QPen(self._wf_centerline, 1))
         p.drawLine(0, h // 2, w, h // 2)
 
         if self._peaks is None or self._peaks.size == 0:
-            p.setPen(QColor("#5C8AAB"))
+            p.setPen(self._wf_text)
             font = p.font()
             font.setPointSize(9)
             font.setLetterSpacing(QFont.PercentageSpacing, 120)
@@ -586,18 +684,15 @@ class WaveformWidget(QWidget):
         progress = max(0.0, min(1.0, progress))
         px = int(progress * w)
 
-        played_color = QColor("#29B6F6")
-        unplayed_color = QColor(120, 170, 210, 60)
-
         for i in range(n):
             x = int(i * bw)
             bar_h = max(1, int(self._peaks[i] * h * 0.88))
-            color = played_color if x < px else unplayed_color
+            color = self._wf_played if x < px else self._wf_unplayed
             p.fillRect(x, (h - bar_h) // 2, max(1, int(bw - 0.5) or 1), bar_h, color)
 
         # Playhead
         if self._duration > 0:
-            p.setPen(QPen(QColor("#80DEEA"), 2))
+            p.setPen(QPen(self._wf_playhead, 2))
             p.drawLine(px, 2, px, h - 2)
 
 
@@ -606,9 +701,9 @@ class AnimatedButton(QToolButton):
     impression that the button physically depresses into the panel."""
 
     def __init__(self, parent=None, *,
-                 shadow_color: QColor = QColor(0, 0, 0, 170),
-                 shadow_blur: int = 18,
-                 shadow_offset: int = 4,
+                 shadow_color: QColor = QColor(0, 0, 0, 160),
+                 shadow_blur: int = 14,
+                 shadow_offset: int = 3,
                  glow: bool = False):
         super().__init__(parent)
         self._rest_offset = shadow_offset
@@ -619,28 +714,39 @@ class AnimatedButton(QToolButton):
         self._shadow.setOffset(0, shadow_offset)
         self.setGraphicsEffect(self._shadow)
 
-        self._anim = QPropertyAnimation(self._shadow, b"offset", self)
-        self._anim.setDuration(110)
-        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        # Animate offset and blur together so the press feels physical: the
+        # shadow shrinks toward the button as it travels down. OutQuad is
+        # snappier than OutCubic and matches typical UI press feedback.
+        self._anim_off = QPropertyAnimation(self._shadow, b"offset", self)
+        self._anim_blur = QPropertyAnimation(self._shadow, b"blurRadius", self)
+        for anim in (self._anim_off, self._anim_blur):
+            anim.setDuration(90)
+            anim.setEasingCurve(QEasingCurve.OutQuad)
 
         if glow:
-            # Subtle cyan glow for the primary action button.
             self._shadow.setColor(QColor(41, 182, 246, 180))
 
-    def _animate_to(self, target_y: float) -> None:
-        self._anim.stop()
-        self._anim.setStartValue(self._shadow.offset())
-        self._anim.setEndValue(QPointF(0, target_y))
-        self._anim.start()
+    def set_shadow_color(self, color: QColor) -> None:
+        self._shadow.setColor(color)
+
+    def _animate(self, off_y: float, blur: float) -> None:
+        self._anim_off.stop()
+        self._anim_off.setStartValue(self._shadow.offset())
+        self._anim_off.setEndValue(QPointF(0, off_y))
+        self._anim_off.start()
+        self._anim_blur.stop()
+        self._anim_blur.setStartValue(self._shadow.blurRadius())
+        self._anim_blur.setEndValue(blur)
+        self._anim_blur.start()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton and self.isEnabled():
-            self._animate_to(0)
+            self._animate(0, max(3.0, self._rest_blur * 0.4))
         super().mousePressEvent(e)
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton:
-            self._animate_to(self._rest_offset)
+            self._animate(self._rest_offset, self._rest_blur)
         super().mouseReleaseEvent(e)
 
 
@@ -697,44 +803,191 @@ class DropZone(QFrame):
 # Main window
 # ============================================================================
 
-APP_QSS = """
-QMainWindow, QWidget#Central { background: #0A1929; color: #E3F2FD; }
-QLabel { color: #B0D4F1; }
+# ============================================================================
+# Themes — palettes for the deep-blue Ocean (default), green Forest, orange
+# Sunset, and grayscale Graphite. Each theme defines the page background, card
+# tones, accent (used by the play button, sliders, badges, and waveform),
+# and a 5-stop "metal" gradient used to give all transport buttons a brushed
+# metal feel: a bright top edge, a highlight band near the top, a flat mid
+# face, and a sharp shadow at the bottom.
+# ============================================================================
 
-QLabel#Title { color: #4FC3F7; font-weight: 700; font-size: 16px; letter-spacing: 6px; }
-QLabel#Subtitle { color: #5C8AAB; font-size: 9px; letter-spacing: 4px; }
-QLabel#SectionLabel { color: #5C8AAB; font-size: 9px; letter-spacing: 5px; }
+THEMES = {
+    "ocean": {
+        "name": "Ocean",
+        "bg":          "#0A1929",
+        "card_top":    "#15324F",
+        "card_bot":    "#10263F",
+        "card_hover":  "#1A4670",
+        "border":      "#1E3A5F",
+        "drop_bg_top": "#102542",
+        "drop_bg_bot": "#0B1C30",
+        "drop_border": "#1E4870",
+        "drop_glow":   "rgba(41, 182, 246, 30)",
+        "accent":      "#29B6F6",
+        "accent_hi":   "#4FC3F7",
+        "accent_glow": "#80DEEA",
+        "accent_dark": "#015D85",
+        "accent_text": "#042032",
+        "text":        "#E3F2FD",
+        "text_dim":    "#B0D4F1",
+        "text_mute":   "#7AAACF",
+        "text_label":  "#5C8AAB",
+        "list_bg":     "#0E2238",
+        "list_hover":  "#15324F",
+        "list_sel_a":  "#1A4D7A",
+        "list_sel_b":  "#2C5A8F",
+        "metal_edge":   "#5C8AB5",
+        "metal_high":   "#3F6A92",
+        "metal_mid":    "#1F3F62",
+        "metal_low":    "#122846",
+        "metal_shadow": "#061122",
+        "metal_text":   "#DDEEFB",
+        "metal_text_hi":"#FFFFFF",
+        "shadow_glow":  "rgba(41, 182, 246, 180)",
+    },
+    "forest": {
+        "name": "Forest",
+        "bg":          "#0A1F18",
+        "card_top":    "#15402E",
+        "card_bot":    "#0F2E20",
+        "card_hover":  "#1B5238",
+        "border":      "#1E4530",
+        "drop_bg_top": "#10301F",
+        "drop_bg_bot": "#0B2418",
+        "drop_border": "#1E5538",
+        "drop_glow":   "rgba(34, 197, 94, 30)",
+        "accent":      "#22C55E",
+        "accent_hi":   "#4ADE80",
+        "accent_glow": "#86EFAC",
+        "accent_dark": "#14532D",
+        "accent_text": "#062012",
+        "text":        "#DCFCE7",
+        "text_dim":    "#A7E0BC",
+        "text_mute":   "#73B891",
+        "text_label":  "#5A8C70",
+        "list_bg":     "#0F2A1D",
+        "list_hover":  "#15402E",
+        "list_sel_a":  "#1B5238",
+        "list_sel_b":  "#2C7A4D",
+        "metal_edge":   "#5CB58A",
+        "metal_high":   "#3F926A",
+        "metal_mid":    "#1F623F",
+        "metal_low":    "#124628",
+        "metal_shadow": "#06220F",
+        "metal_text":   "#DDF5E5",
+        "metal_text_hi":"#FFFFFF",
+        "shadow_glow":  "rgba(34, 197, 94, 180)",
+    },
+    "sunset": {
+        "name": "Sunset",
+        "bg":          "#1A0F08",
+        "card_top":    "#3E1F0E",
+        "card_bot":    "#2A1408",
+        "card_hover":  "#5A2D14",
+        "border":      "#4A2510",
+        "drop_bg_top": "#3A1B0C",
+        "drop_bg_bot": "#1F0F06",
+        "drop_border": "#5A2D14",
+        "drop_glow":   "rgba(249, 115, 22, 30)",
+        "accent":      "#F97316",
+        "accent_hi":   "#FB923C",
+        "accent_glow": "#FED7AA",
+        "accent_dark": "#9A3412",
+        "accent_text": "#26110A",
+        "text":        "#FFEDD5",
+        "text_dim":    "#FBC58A",
+        "text_mute":   "#C88E5C",
+        "text_label":  "#946540",
+        "list_bg":     "#2A1408",
+        "list_hover":  "#3E1F0E",
+        "list_sel_a":  "#5A2D14",
+        "list_sel_b":  "#7A3F1B",
+        "metal_edge":   "#C58B4D",
+        "metal_high":   "#A66931",
+        "metal_mid":    "#6B3F18",
+        "metal_low":    "#46280C",
+        "metal_shadow": "#221404",
+        "metal_text":   "#FFE0BC",
+        "metal_text_hi":"#FFFFFF",
+        "shadow_glow":  "rgba(249, 115, 22, 180)",
+    },
+    "graphite": {
+        "name": "Graphite",
+        "bg":          "#0F0F0F",
+        "card_top":    "#252528",
+        "card_bot":    "#1A1A1C",
+        "card_hover":  "#36363A",
+        "border":      "#2E2E32",
+        "drop_bg_top": "#1F1F22",
+        "drop_bg_bot": "#141416",
+        "drop_border": "#3A3A3E",
+        "drop_glow":   "rgba(212, 212, 216, 28)",
+        "accent":      "#D4D4D8",
+        "accent_hi":   "#FAFAFA",
+        "accent_glow": "#F4F4F5",
+        "accent_dark": "#71717A",
+        "accent_text": "#0A0A0A",
+        "text":        "#FAFAFA",
+        "text_dim":    "#D4D4D8",
+        "text_mute":   "#A1A1AA",
+        "text_label":  "#71717A",
+        "list_bg":     "#161618",
+        "list_hover":  "#252528",
+        "list_sel_a":  "#3F3F46",
+        "list_sel_b":  "#52525B",
+        "metal_edge":   "#C0C5CC",
+        "metal_high":   "#909598",
+        "metal_mid":    "#5A5F65",
+        "metal_low":    "#34373C",
+        "metal_shadow": "#0D0E10",
+        "metal_text":   "#F4F4F5",
+        "metal_text_hi":"#FFFFFF",
+        "shadow_glow":  "rgba(212, 212, 216, 140)",
+    },
+}
+
+DEFAULT_THEME = "ocean"
+
+
+_QSS_TEMPLATE = Template("""
+QMainWindow, QWidget#Central { background: $bg; color: $text; }
+QLabel { color: $text_dim; }
+
+QLabel#Title { color: $accent_hi; font-weight: 700; font-size: 16px; letter-spacing: 6px; }
+QLabel#Subtitle { color: $text_label; font-size: 9px; letter-spacing: 4px; }
+QLabel#SectionLabel { color: $text_label; font-size: 9px; letter-spacing: 5px; }
 QLabel#Badge {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #4FC3F7, stop:1 #29B6F6);
-    color: #062338; font-weight: 700;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $accent_hi, stop:1 $accent);
+    color: $accent_text; font-weight: 700;
     padding: 3px 10px; border-radius: 6px; font-size: 9px; letter-spacing: 1px;
 }
-QLabel#FileName { color: #ECF6FE; font-size: 13px; }
-QLabel#FileMeta { color: #7AAACF; font-size: 10px; }
+QLabel#FileName { color: $text; font-size: 13px; }
+QLabel#FileMeta { color: $text_mute; font-size: 10px; }
 QLabel#Time {
-    color: #4FC3F7; font-family: 'Consolas', 'Courier New', monospace;
+    color: $accent_hi; font-family: 'Consolas', 'Courier New', monospace;
     font-size: 14px; min-width: 160px; padding-left: 12px;
 }
-QLabel#StatusLabel { color: #7AAACF; font-size: 10px; }
-QLabel#StatusKey { color: #5C8AAB; font-size: 9px; letter-spacing: 2px; }
+QLabel#StatusLabel { color: $text_mute; font-size: 10px; }
+QLabel#StatusKey { color: $text_label; font-size: 9px; letter-spacing: 2px; }
 
 QFrame#Card, QFrame#FileCard {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #15324F, stop:1 #10263F);
-    border: 1px solid #1E3A5F;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $card_top, stop:1 $card_bot);
+    border: 1px solid $border;
     border-radius: 10px;
 }
-QFrame#FileCard:hover { border-color: #29B6F6; }
+QFrame#FileCard:hover { border-color: $accent; }
 QFrame#DropZone {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #102542, stop:1 #0B1C30);
-    border: 2px dashed #1E4870;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $drop_bg_top, stop:1 $drop_bg_bot);
+    border: 2px dashed $drop_border;
     border-radius: 12px;
 }
 QFrame#DropZone[dragOver="true"] {
-    border: 2px dashed #4FC3F7;
-    background: rgba(41, 182, 246, 30);
+    border: 2px dashed $accent_hi;
+    background: $drop_glow;
 }
-QLabel#DropTitle { color: #90CAF9; font-size: 12px; letter-spacing: 4px; font-weight: 700; }
-QLabel#DropHint { color: #5C8AAB; font-size: 9px; letter-spacing: 2px; }
+QLabel#DropTitle { color: $text_dim; font-size: 12px; letter-spacing: 4px; font-weight: 700; }
+QLabel#DropHint { color: $text_label; font-size: 9px; letter-spacing: 2px; }
 
 QFrame#ErrorBox {
     background: #3E1B1F; border: 1px solid #6E2C30;
@@ -742,99 +995,176 @@ QFrame#ErrorBox {
 }
 QLabel#ErrorText { color: #FFB4B8; font-size: 11px; }
 
+/* === Soft brushed-metal transport buttons ===
+ * Three-stop vertical gradient with a uniform single-color border (no
+ * bevel highlight strips, no harsh shadow band at the bottom). The
+ * pressed state simply inverts the gradient and tints the border with
+ * the accent — the depth feeling comes from the AnimatedButton's drop
+ * shadow shrinking on press. */
 QToolButton#Ctrl {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                stop:0 #2C5680, stop:0.5 #1B3D62, stop:1 #122E4D);
-    border-top: 1px solid #4D7DAE;
-    border-left: 1px solid #2C5680;
-    border-right: 1px solid #2C5680;
-    border-bottom: 1px solid #0A1A2D;
-    color: #DDEEFB;
-    min-width: 42px; min-height: 42px;
-    border-radius: 11px;
+        stop:0   $metal_high,
+        stop:0.5 $metal_mid,
+        stop:1   $metal_low);
+    border: 1px solid $metal_high;
+    color: $metal_text;
+    min-width: 44px; min-height: 44px;
+    border-radius: 16px;
     font-size: 17px;
     padding: 0px;
     font-family: 'Segoe UI Symbol', 'Segoe UI', sans-serif;
 }
 QToolButton#Ctrl:hover {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                stop:0 #3B6EA6, stop:0.5 #275387, stop:1 #1A3D62);
-    border-top-color: #6FA0D0;
-    border-left-color: #3B6EA6;
-    border-right-color: #3B6EA6;
-    color: #FFFFFF;
+        stop:0   $metal_edge,
+        stop:0.5 $metal_high,
+        stop:1   $metal_mid);
+    border-color: $accent;
+    color: $metal_text_hi;
 }
 QToolButton#Ctrl:pressed {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                stop:0 #122E4D, stop:0.5 #1B3D62, stop:1 #2C5680);
-    border-top: 1px solid #0A1A2D;
-    border-bottom: 1px solid #4D7DAE;
-    padding-top: 1px;
+        stop:0   $metal_low,
+        stop:0.5 $metal_mid,
+        stop:1   $metal_high);
+    border-color: $accent_dark;
 }
 QToolButton#Ctrl:disabled {
-    background: #0F2238;
-    border-top: 1px solid #1E3A5F;
-    border-left: 1px solid #15314F;
-    border-right: 1px solid #15314F;
-    border-bottom: 1px solid #0A1A2D;
-    color: #2D4A6B;
+    background: $list_bg;
+    border: 1px solid $border;
+    color: $text_label;
+}
+QToolButton#Ctrl::menu-indicator { width: 0; height: 0; image: none; }
+
+QToolButton#CtrlSmall {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0   $metal_high,
+        stop:0.5 $metal_mid,
+        stop:1   $metal_low);
+    border: 1px solid $metal_high;
+    color: $metal_text;
+    min-width: 30px; max-width: 32px;
+    min-height: 30px; max-height: 32px;
+    border-radius: 10px;
+    font-size: 13px; font-weight: 700;
+    padding: 0px;
+    font-family: 'Segoe UI Symbol', 'Segoe UI', sans-serif;
+}
+QToolButton#CtrlSmall:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0   $metal_edge,
+        stop:0.5 $metal_high,
+        stop:1   $metal_mid);
+    border-color: $accent;
+    color: $metal_text_hi;
+}
+QToolButton#CtrlSmall:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0   $metal_low,
+        stop:0.5 $metal_mid,
+        stop:1   $metal_high);
+    border-color: $accent_dark;
+}
+QToolButton#CtrlSmall:disabled {
+    background: $list_bg;
+    border: 1px solid $border;
+    color: $text_label;
 }
 
+/* === Primary action: soft pill play button using the accent ramp.
+ * padding-left nudges the asymmetric ▶ glyph so it looks centered. */
 QToolButton#PlayBtn {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                stop:0 #80DEEA, stop:0.5 #4FC3F7, stop:1 #1A8FCB);
-    border-top: 1px solid #B8EFFB;
-    border-left: 1px solid #4FC3F7;
-    border-right: 1px solid #4FC3F7;
-    border-bottom: 1px solid #015D85;
-    color: #042032;
-    min-width: 56px; min-height: 56px;
-    border-radius: 14px;
-    font-size: 22px; font-weight: 700;
+        stop:0   $accent_hi,
+        stop:0.5 $accent,
+        stop:1   $accent_dark);
+    border: 1px solid $accent_hi;
+    color: $accent_text;
+    min-width: 60px; min-height: 60px;
+    border-radius: 22px;
+    font-size: 24px; font-weight: 700;
     font-family: 'Segoe UI Symbol', 'Segoe UI', sans-serif;
-    padding: 0px;
+    padding-left: 4px;
 }
 QToolButton#PlayBtn:hover {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                stop:0 #C5F2FB, stop:0.5 #80DEEA, stop:1 #29B6F6);
-    border-top-color: #E1FAFF;
+        stop:0   $accent_glow,
+        stop:0.5 $accent_hi,
+        stop:1   $accent);
+    border-color: $accent_glow;
 }
 QToolButton#PlayBtn:pressed {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                stop:0 #1A8FCB, stop:0.5 #4FC3F7, stop:1 #80DEEA);
-    border-top: 1px solid #015D85;
-    border-bottom: 1px solid #B8EFFB;
-    padding-top: 1px;
+        stop:0   $accent_dark,
+        stop:0.5 $accent,
+        stop:1   $accent_hi);
+    border-color: $accent;
 }
 
 QSlider::groove:horizontal {
-    background: #15324F; height: 6px; border-radius: 3px;
+    background: $card_top; height: 6px; border-radius: 3px;
 }
 QSlider::sub-page:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #29B6F6, stop:1 #4FC3F7);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 $accent, stop:1 $accent_hi);
     height: 6px; border-radius: 3px;
 }
 QSlider::handle:horizontal {
-    background: #FFFFFF; width: 14px; height: 14px;
+    background: $metal_text_hi; width: 14px; height: 14px;
     margin: -5px 0; border-radius: 8px;
-    border: 2px solid #29B6F6;
+    border: 2px solid $accent;
 }
-QSlider::handle:horizontal:hover { background: #80DEEA; border-color: #4FC3F7; }
+QSlider::handle:horizontal:hover { background: $accent_glow; border-color: $accent_hi; }
 
 QListWidget {
-    background: #0E2238; border: 1px solid #1E3A5F; border-radius: 10px;
-    color: #B0D4F1; font-size: 11px; outline: 0;
+    background: $list_bg; border: 1px solid $border; border-radius: 10px;
+    color: $text_dim; font-size: 11px; outline: 0;
     padding: 4px;
 }
 QListWidget::item { padding: 8px 12px; border-radius: 6px; margin: 1px; }
-QListWidget::item:hover { background: #15324F; }
+QListWidget::item:hover { background: $list_hover; }
 QListWidget::item:selected {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1A4D7A, stop:1 #2C5A8F);
-    color: #FFFFFF;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 $list_sel_a, stop:1 $list_sel_b);
+    color: $metal_text_hi;
 }
 
-QFrame#Divider { background: #1E3A5F; max-height: 1px; }
-"""
+QMenu {
+    background: $card_top;
+    border: 1px solid $border;
+    color: $text;
+    padding: 5px;
+    border-radius: 8px;
+}
+QMenu::item {
+    padding: 7px 28px 7px 14px;
+    border-radius: 6px;
+}
+QMenu::item:selected {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 $list_sel_a, stop:1 $list_sel_b);
+    color: $metal_text_hi;
+}
+QMenu::item:checked { color: $accent_hi; }
+
+QFrame#Divider {
+    background: $border;
+    border: none;
+    min-height: 1px;
+    max-height: 1px;
+}
+""")
+
+
+def build_qss(theme_key: str) -> str:
+    palette = THEMES.get(theme_key, THEMES[DEFAULT_THEME])
+    return _QSS_TEMPLATE.safe_substitute(palette)
+
+
+def _parse_rgba(s: str) -> QColor:
+    """Parse a 'rgba(r, g, b, a)' CSS-style string into a QColor."""
+    inner = s[s.index("(") + 1: s.index(")")]
+    parts = [int(p.strip()) for p in inner.split(",")]
+    while len(parts) < 4:
+        parts.append(255)
+    return QColor(*parts)
 
 
 class MainWindow(QMainWindow):
@@ -849,13 +1179,17 @@ class MainWindow(QMainWindow):
         self.current_index: int = -1
         self._user_seeking = False
 
+        self._theme_key: str = DEFAULT_THEME
         self._build_ui()
         self._connect_engine()
         self._install_shortcuts()
         self._update_ui_state()
-        # Sync engine to default UI values (100% volume, 1.0x speed)
+        # Sync engine to default UI values (100% volume, 1.00x speed)
         self.engine.set_volume(self.vol_slider.value() / 100.0)
-        self.engine.set_speed(self.spd_slider.value() / 100.0)
+        self._speed_set(1.0)
+        # Apply persisted theme (or default) from settings.json next to the .exe
+        saved = _load_settings().get("theme", DEFAULT_THEME)
+        self._apply_theme(saved if saved in THEMES else DEFAULT_THEME)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -875,6 +1209,30 @@ class MainWindow(QMainWindow):
         self.header_badge = QLabel(""); self.header_badge.setObjectName("Badge"); self.header_badge.hide()
         self.header_size = QLabel(""); self.header_size.setObjectName("StatusLabel")
         header.addWidget(self.header_badge); header.addSpacing(8); header.addWidget(self.header_size)
+
+        # Settings (theme picker) — gear button on the far right.
+        header.addSpacing(10)
+        self.btn_settings = AnimatedButton()
+        self.btn_settings.setText("⚙")
+        self.btn_settings.setObjectName("Ctrl")
+        self.btn_settings.setToolTip("Theme")
+        self.btn_settings.setPopupMode(QToolButton.InstantPopup)
+        self._theme_menu = QMenu(self.btn_settings)
+        self._theme_actions = {}
+        theme_header = self._theme_menu.addAction("THEME")
+        theme_header.setEnabled(False)
+        for key, theme in THEMES.items():
+            act = self._theme_menu.addAction(theme["name"])
+            act.setCheckable(True)
+            act.setData(key)
+            act.triggered.connect(lambda checked=False, k=key: self._apply_theme(k))
+            self._theme_actions[key] = act
+        self._theme_menu.addSeparator()
+        self._ctxmenu_action = self._theme_menu.addAction("Install in Windows right-click menu")
+        self._ctxmenu_action.triggered.connect(self._toggle_context_menu)
+        self._theme_menu.aboutToShow.connect(self._refresh_ctxmenu_action)
+        self.btn_settings.setMenu(self._theme_menu)
+        header.addWidget(self.btn_settings)
         outer.addLayout(header)
 
         # Drop zone (no file loaded)
@@ -917,8 +1275,10 @@ class MainWindow(QMainWindow):
         self.seek_slider.sliderReleased.connect(self._on_seek_release)
         outer.addWidget(self.seek_slider)
 
-        # Transport controls — all unicode media-control glyphs from the same family
-        # for visual consistency. AnimatedButton gives them depth + press animation.
+        # Transport controls — same Unicode media-control family for consistency.
+        # The row stays centered when the window is wide via stretches on both
+        # sides; on a narrow window the stretches collapse and the controls
+        # take the natural width.
         controls = QHBoxLayout(); controls.setSpacing(10)
 
         def ctrl(text: str, tip: str) -> AnimatedButton:
@@ -926,60 +1286,75 @@ class MainWindow(QMainWindow):
             b.setText(text); b.setObjectName("Ctrl"); b.setToolTip(tip)
             return b
 
-        self.btn_stop  = ctrl("⏹", "Stop  (Esc)")              # ⏹
-        self.btn_back5 = ctrl("⏪", "Back 5s  (←)")        # ⏪
-        self.btn_prev  = ctrl("⏮", "Previous  (Ctrl+←)")  # ⏮
-        self.btn_play  = AnimatedButton(glow=True, shadow_blur=28, shadow_offset=5)
-        self.btn_play.setText("▶")                              # ▶
+        def ctrl_small(text: str, tip: str) -> AnimatedButton:
+            b = AnimatedButton(shadow_blur=10, shadow_offset=2)
+            b.setText(text); b.setObjectName("CtrlSmall"); b.setToolTip(tip)
+            return b
+
+        self.btn_stop  = ctrl("⏹", "Stop  (Esc)")
+        self.btn_prev  = ctrl("⏮", "Previous  (Ctrl+←)")
+        self.btn_play  = AnimatedButton(glow=True, shadow_blur=24, shadow_offset=5)
+        self.btn_play.setText("▶")
         self.btn_play.setObjectName("PlayBtn")
         self.btn_play.setToolTip("Play / Pause  (Space)")
-        self.btn_next  = ctrl("⏭", "Next  (Ctrl+→)")      # ⏭
-        self.btn_fwd5  = ctrl("⏩", "Forward 5s  (→)")     # ⏩
+        self.btn_next  = ctrl("⏭", "Next  (Ctrl+→)")
 
         self.btn_stop.clicked.connect(self.engine.stop)
         self.btn_play.clicked.connect(self.engine.toggle_play)
         self.btn_prev.clicked.connect(self.previous_track)
         self.btn_next.clicked.connect(self.next_track)
-        self.btn_back5.clicked.connect(lambda: self.engine.seek(self.engine.position - 5))
-        self.btn_fwd5.clicked.connect(lambda: self.engine.seek(self.engine.position + 5))
 
-        for w in (self.btn_stop, self.btn_back5, self.btn_prev, self.btn_play,
-                  self.btn_next, self.btn_fwd5):
+        controls.addStretch(1)
+        for w in (self.btn_stop, self.btn_prev, self.btn_play, self.btn_next):
             controls.addWidget(w)
-
         self.time_lbl = QLabel("0:00.00 / 0:00.00"); self.time_lbl.setObjectName("Time")
         controls.addWidget(self.time_lbl)
-        controls.addStretch()
+        controls.addStretch(1)
 
         outer.addLayout(controls)
 
-        # Speed + Volume row (sliders for fine control)
-        sliders = QHBoxLayout(); sliders.setSpacing(10)
-        spd_lbl = QLabel("SPEED"); spd_lbl.setObjectName("StatusKey")
-        self.spd_slider = QSlider(Qt.Horizontal)
-        self.spd_slider.setRange(50, 250)   # 0.50x .. 2.50x
-        self.spd_slider.setValue(100)
-        self.spd_slider.setFixedWidth(140)
-        self.spd_slider.valueChanged.connect(self._on_speed)
-        self.spd_pct = QLabel("1.00x"); self.spd_pct.setObjectName("StatusLabel"); self.spd_pct.setMinimumWidth(40)
-        # Double-click on the speed slider resets to 1.0x
-        self.spd_slider.mouseDoubleClickEvent = lambda _e: self.spd_slider.setValue(100)
+        # Speed + Volume row, also centered.
+        sliders = QHBoxLayout(); sliders.setSpacing(6)
 
-        sliders.addWidget(spd_lbl); sliders.addWidget(self.spd_slider); sliders.addWidget(self.spd_pct)
-        sliders.addStretch()
+        self._speed: float = 1.0
+        spd_lbl = QLabel("SPEED"); spd_lbl.setObjectName("StatusKey")
+        self.btn_spd_minus = ctrl_small("−", "Slower (-0.05x)")
+        self.btn_spd_minus.clicked.connect(lambda: self._speed_step(-0.05))
+        self.spd_pct = QLabel("1.00x"); self.spd_pct.setObjectName("StatusLabel")
+        self.spd_pct.setMinimumWidth(48); self.spd_pct.setAlignment(Qt.AlignCenter)
+        self.spd_pct.setStyleSheet("font-family: 'Consolas','Courier New',monospace; font-size: 11px;")
+        self.btn_spd_plus = ctrl_small("+", "Faster (+0.05x)")
+        self.btn_spd_plus.clicked.connect(lambda: self._speed_step(0.05))
+        self.btn_spd_reset = ctrl_small("⟲", "Reset to 1.00x")
+        self.btn_spd_reset.clicked.connect(lambda: self._speed_set(1.0))
+
+        sliders.addStretch(1)
+        sliders.addWidget(spd_lbl)
+        sliders.addSpacing(4)
+        sliders.addWidget(self.btn_spd_minus)
+        sliders.addWidget(self.spd_pct)
+        sliders.addWidget(self.btn_spd_plus)
+        sliders.addSpacing(2)
+        sliders.addWidget(self.btn_spd_reset)
+        sliders.addSpacing(24)
 
         vol_lbl = QLabel("VOL"); vol_lbl.setObjectName("StatusKey")
         self.vol_slider = QSlider(Qt.Horizontal)
         self.vol_slider.setRange(0, 100); self.vol_slider.setValue(100)
         self.vol_slider.setFixedWidth(140)
         self.vol_slider.valueChanged.connect(self._on_volume)
-        self.vol_pct = QLabel("100%"); self.vol_pct.setObjectName("StatusLabel"); self.vol_pct.setMinimumWidth(40)
-        sliders.addWidget(vol_lbl); sliders.addWidget(self.vol_slider); sliders.addWidget(self.vol_pct)
+        self.vol_pct = QLabel("100%"); self.vol_pct.setObjectName("StatusLabel"); self.vol_pct.setMinimumWidth(36)
+        sliders.addWidget(vol_lbl)
+        sliders.addSpacing(4)
+        sliders.addWidget(self.vol_slider)
+        sliders.addWidget(self.vol_pct)
+        sliders.addStretch(1)
 
         outer.addLayout(sliders)
 
-        # Divider
-        d1 = QFrame(); d1.setObjectName("Divider"); d1.setFrameShape(QFrame.HLine); d1.setFixedHeight(1)
+        # Thin separator (no QFrame.HLine — that draws a hard system-themed
+        # etched line on top of our QSS styling, which looked unnatural).
+        d1 = QFrame(); d1.setObjectName("Divider")
         outer.addWidget(d1)
 
         # Status bar
@@ -1206,7 +1581,7 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------- ui helpers
     def _update_ui_state(self):
         has_track = self.engine.track is not None
-        for b in (self.btn_play, self.btn_stop, self.btn_back5, self.btn_fwd5):
+        for b in (self.btn_play, self.btn_stop):
             b.setEnabled(has_track)
         for b in (self.btn_prev, self.btn_next):
             b.setEnabled(len(self.playlist) > 1)
@@ -1215,10 +1590,81 @@ class MainWindow(QMainWindow):
         self.engine.set_volume(v / 100.0)
         self.vol_pct.setText(f"{v}%")
 
-    def _on_speed(self, v: int):
-        speed = v / 100.0
-        self.engine.set_speed(speed)
-        self.spd_pct.setText(f"{speed:.2f}x")
+    def _refresh_ctxmenu_action(self) -> None:
+        """Sync the gear-menu install/uninstall label with the actual registry state."""
+        if not _ctxmenu_supported():
+            self._ctxmenu_action.setText("Install in Windows right-click menu")
+            self._ctxmenu_action.setEnabled(False)
+            self._ctxmenu_action.setToolTip("Available only in the packaged .exe build")
+            return
+        self._ctxmenu_action.setEnabled(True)
+        self._ctxmenu_action.setToolTip("")
+        if _ctxmenu_is_installed():
+            self._ctxmenu_action.setText("Remove from Windows right-click menu")
+        else:
+            self._ctxmenu_action.setText("Install in Windows right-click menu")
+
+    def _toggle_context_menu(self) -> None:
+        if _ctxmenu_is_installed():
+            ok = _ctxmenu_uninstall()
+            if ok:
+                QMessageBox.information(
+                    self, "Right-click menu",
+                    "Removed. The 'Play with PCM-Player' entry is no longer in the right-click menu."
+                )
+            else:
+                QMessageBox.warning(self, "Right-click menu", "Could not remove the entry.")
+        else:
+            ok = _ctxmenu_install()
+            if ok:
+                QMessageBox.information(
+                    self, "Right-click menu",
+                    "Installed. Right-click any audio file in Explorer and choose "
+                    "'Play with PCM-Player'. Selecting multiple files sends them all "
+                    "as a playlist.\n\nIf you move PCMPlayer.exe to another folder, "
+                    "open this dialog again to re-install with the new path."
+                )
+            else:
+                QMessageBox.warning(
+                    self, "Right-click menu",
+                    "Could not write to the registry. Check that the .exe path is "
+                    "writable and try again."
+                )
+
+    def _apply_theme(self, theme_key: str) -> None:
+        if theme_key not in THEMES:
+            theme_key = DEFAULT_THEME
+        theme = THEMES[theme_key]
+        self._theme_key = theme_key
+
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_qss(theme_key))
+
+        # Re-skin theme-aware widgets that don't get all colors via QSS
+        self.waveform.apply_theme(theme)
+        self.btn_play.set_shadow_color(_parse_rgba(theme["shadow_glow"]))
+
+        # Update menu checkmarks
+        for k, act in self._theme_actions.items():
+            act.setChecked(k == theme_key)
+
+        # Persist into settings.json (portable, no registry)
+        data = _load_settings()
+        data["theme"] = theme_key
+        _save_settings(data)
+
+    def _speed_step(self, delta: float):
+        self._speed_set(self._speed + delta)
+
+    def _speed_set(self, v: float):
+        v = max(0.50, min(2.50, round(v, 2)))
+        self._speed = v
+        self.engine.set_speed(v)
+        self.spd_pct.setText(f"{v:.2f}x")
+        self.btn_spd_minus.setEnabled(v > 0.50)
+        self.btn_spd_plus.setEnabled(v < 2.50)
+        self.btn_spd_reset.setEnabled(v != 1.0)
 
     def _on_seek_release(self):
         self._user_seeking = False
@@ -1260,7 +1706,8 @@ def main():
     app.setStyle("Fusion")
     app.setApplicationName("PCM Player")
     app.setOrganizationName("Tributo Devido")
-    app.setStyleSheet(APP_QSS)
+    # Theme stylesheet is applied by MainWindow.__init__ once it has loaded
+    # the persisted theme from settings.json (portable, next to the .exe).
 
     icon_path = _resource_path("icon.ico")
     if os.path.exists(icon_path):
@@ -1269,11 +1716,14 @@ def main():
     win = MainWindow()
     win.show()
 
-    # Accept files passed on the command line
+    # Accept files passed on the command line (file-association double-click,
+    # context-menu "Play with PCM-Player", drag-onto-shortcut, etc.).
+    # Auto-play immediately when launched this way.
     args = sys.argv[1:]
     files = [a for a in args if os.path.isfile(a)]
     if files:
         win._add_files(files)
+        win.engine.play()
 
     sys.exit(app.exec())
 

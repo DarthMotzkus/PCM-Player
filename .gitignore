@@ -3,6 +3,7 @@ dist/
 out.txt
 err.txt
 pcm_player_error.log
+settings.json       # Per-user runtime config (theme); not part of the source.
 icon.png            # Source artwork is large; we ship only icon.ico in the repo.
 
 # Byte-compiled / optimized / DLL files
