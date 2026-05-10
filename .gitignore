@@ -1,3 +1,10 @@
+# --- PCM Player local artifacts ---
+dist/
+out.txt
+err.txt
+pcm_player_error.log
+icon.png            # Source artwork is large; we ship only icon.ico in the repo.
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

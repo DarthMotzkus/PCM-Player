@@ -22,17 +22,38 @@ from __future__ import annotations
 import io
 import os
 import sys
+import atexit
 import threading
 import traceback
+import faulthandler
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 
 def _crash_log_path() -> str:
-    # Write next to the executable when frozen; otherwise next to the script.
     base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, "pcm_player_error.log")
+
+
+# faulthandler catches native crashes (segfault / access violation from C extensions)
+# that sys.excepthook cannot see, and writes a C-level stack trace.
+try:
+    _CRASH_LOG_PATH = _crash_log_path()
+    _CRASH_LOG = open(_CRASH_LOG_PATH, "a", encoding="utf-8", buffering=1)
+    faulthandler.enable(file=_CRASH_LOG, all_threads=True)
+
+    def _purge_empty_log() -> None:
+        try:
+            _CRASH_LOG.close()
+            if os.path.getsize(_CRASH_LOG_PATH) == 0:
+                os.remove(_CRASH_LOG_PATH)
+        except Exception:
+            pass
+
+    atexit.register(_purge_empty_log)
+except Exception:
+    _CRASH_LOG = None
 
 
 def _log_fatal(prefix: str, exc: BaseException) -> None:
@@ -57,16 +78,20 @@ def _excepthook(exctype, value, tb):
 
 sys.excepthook = _excepthook
 
-try:
-    import numpy as np
-    import sounddevice as sd
-    import soundfile as sf
-except Exception as _e:
-    _log_fatal("Import failure", _e)
-    raise
+
+def _resource_path(name: str) -> str:
+    """Locate bundled resources both in dev mode and inside a PyInstaller bundle."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
 
 from PySide6.QtCore import (
-    QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal, QObject, QEvent
+    QPoint, QPointF, QPropertyAnimation, QRect, QSize, Qt, QTimer, QUrl,
+    Signal, QObject, QEvent, QEasingCurve,
 )
 from PySide6.QtGui import (
     QAction, QBrush, QColor, QDragEnterEvent, QDropEvent, QFont,
@@ -74,9 +99,9 @@ from PySide6.QtGui import (
     QPixmap, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QGridLayout,
+    QApplication, QFileDialog, QFrame, QGraphicsDropShadowEffect,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPushButton, QSizePolicy, QSlider, QSpinBox,
+    QMessageBox, QPushButton, QSizePolicy, QSlider,
     QStyleFactory, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -290,8 +315,9 @@ class AudioEngine(QObject):
         self._samples: Optional[np.ndarray] = None
         self._sample_rate: int = 44100
         self._channels: int = 2
-        self._position: int = 0       # frame index
-        self._volume: float = 0.85
+        self._fpos: float = 0.0       # fractional frame position (supports variable speed)
+        self._volume: float = 1.0
+        self._speed: float = 1.0      # 1.0 = real time; <1 slower, >1 faster (changes pitch)
         self._state: str = "idle"
         self._track: Optional[TrackInfo] = None
 
@@ -311,18 +337,24 @@ class AudioEngine(QObject):
         return (len(self._samples) / float(self._sample_rate)) if self._samples is not None else 0.0
     @property
     def position(self) -> float:
-        return (self._position / float(self._sample_rate)) if self._samples is not None else 0.0
+        return (self._fpos / float(self._sample_rate)) if self._samples is not None else 0.0
     @property
     def volume(self) -> float: return self._volume
+    @property
+    def speed(self) -> float: return self._speed
 
     def set_volume(self, v: float) -> None:
         self._volume = max(0.0, min(1.0, float(v)))
+
+    def set_speed(self, v: float) -> None:
+        with self._lock:
+            self._speed = max(0.25, min(3.0, float(v)))
 
     # -- internal -----------------------------------------------------------
     def _emit_position(self) -> None:
         self.position_changed.emit(self.position)
         if (self._samples is not None
-                and self._position >= len(self._samples)
+                and self._fpos >= len(self._samples)
                 and self._state == "playing"):
             self._set_state("idle")
             self._poll.stop()
@@ -348,17 +380,43 @@ class AudioEngine(QObject):
             if self._samples is None:
                 outdata.fill(0)
                 return
-            end = self._position + frames
-            if end >= len(self._samples):
-                remaining = max(0, len(self._samples) - self._position)
-                if remaining > 0:
-                    outdata[:remaining] = self._samples[self._position:self._position + remaining] * self._volume
-                if remaining < frames:
-                    outdata[remaining:].fill(0)
-                self._position = len(self._samples)
+            n_in = len(self._samples)
+            speed = self._speed
+            # Fast path at 1x: integer-indexed copy, no interp cost.
+            if speed == 1.0:
+                start = int(self._fpos)
+                end = start + frames
+                if end >= n_in:
+                    remaining = max(0, n_in - start)
+                    if remaining > 0:
+                        outdata[:remaining] = self._samples[start:start + remaining] * self._volume
+                    if remaining < frames:
+                        outdata[remaining:].fill(0)
+                    self._fpos = float(n_in)
+                    raise sd.CallbackStop
+                outdata[:] = self._samples[start:end] * self._volume
+                self._fpos = float(end)
+                return
+
+            # Variable speed: linear interpolation between adjacent input frames.
+            idx = self._fpos + np.arange(frames, dtype=np.float64) * speed
+            end_fpos = self._fpos + frames * speed
+            if end_fpos >= n_in - 1:
+                valid = int(np.searchsorted(idx, n_in - 1, side="left"))
+                if valid > 0:
+                    iv = idx[:valid]
+                    i0 = iv.astype(np.int64)
+                    frac = (iv - i0).reshape(-1, 1).astype(np.float32)
+                    outdata[:valid] = (self._samples[i0] * (1.0 - frac)
+                                       + self._samples[i0 + 1] * frac) * self._volume
+                outdata[valid:].fill(0)
+                self._fpos = float(n_in)
                 raise sd.CallbackStop
-            outdata[:] = self._samples[self._position:end] * self._volume
-            self._position = end
+            i0 = idx.astype(np.int64)
+            frac = (idx - i0).reshape(-1, 1).astype(np.float32)
+            outdata[:] = (self._samples[i0] * (1.0 - frac)
+                          + self._samples[i0 + 1] * frac) * self._volume
+            self._fpos = end_fpos
 
     # -- public commands ----------------------------------------------------
     def load(self, track: TrackInfo) -> None:
@@ -369,7 +427,7 @@ class AudioEngine(QObject):
                 self._samples = data
                 self._sample_rate = sr
                 self._channels = data.shape[1]
-                self._position = 0
+                self._fpos = 0.0
                 self._track = track
                 track.duration = len(data) / float(sr)
             self.track_loaded.emit(track)
@@ -392,8 +450,8 @@ class AudioEngine(QObject):
         if self._state == "playing":
             return
         with self._lock:
-            if self._position >= len(self._samples):
-                self._position = 0
+            if self._fpos >= len(self._samples):
+                self._fpos = 0.0
         try:
             self._close_stream()
             self._stream = sd.OutputStream(
@@ -418,7 +476,7 @@ class AudioEngine(QObject):
     def stop(self) -> None:
         self._close_stream()
         with self._lock:
-            self._position = 0
+            self._fpos = 0.0
         self._set_state("idle")
         self._poll.stop()
         self.position_changed.emit(0.0)
@@ -436,8 +494,8 @@ class AudioEngine(QObject):
         # Seamless seek: stop the stream, jump the cursor, restart if needed.
         self._close_stream()
         with self._lock:
-            target = int(max(0.0, min(seconds, self.duration)) * self._sample_rate)
-            self._position = min(target, len(self._samples))
+            target = max(0.0, min(seconds, self.duration)) * self._sample_rate
+            self._fpos = min(target, float(len(self._samples)))
         if was_playing:
             try:
                 self._stream = sd.OutputStream(
@@ -499,17 +557,21 @@ class WaveformWidget(QWidget):
         p.setRenderHint(QPainter.Antialiasing, False)
         w, h = self.width(), self.height()
 
-        # Background card
-        p.fillRect(self.rect(), QColor("#1f1f1f"))
-        p.setPen(QPen(QColor("#2e2e2e"), 1))
+        # Background card with subtle vertical gradient
+        from PySide6.QtGui import QLinearGradient
+        bg = QLinearGradient(0, 0, 0, h)
+        bg.setColorAt(0.0, QColor("#102542"))
+        bg.setColorAt(1.0, QColor("#0B1C30"))
+        p.fillRect(self.rect(), bg)
+        p.setPen(QPen(QColor("#1E3A5F"), 1))
         p.drawRect(0, 0, w - 1, h - 1)
 
         # Centerline
-        p.setPen(QPen(QColor(140, 135, 128, 30), 1))
+        p.setPen(QPen(QColor(80, 150, 200, 40), 1))
         p.drawLine(0, h // 2, w, h // 2)
 
         if self._peaks is None or self._peaks.size == 0:
-            p.setPen(QColor("#666"))
+            p.setPen(QColor("#5C8AAB"))
             font = p.font()
             font.setPointSize(9)
             font.setLetterSpacing(QFont.PercentageSpacing, 120)
@@ -524,8 +586,8 @@ class WaveformWidget(QWidget):
         progress = max(0.0, min(1.0, progress))
         px = int(progress * w)
 
-        played_color = QColor("#EF9F27")
-        unplayed_color = QColor(140, 135, 128, 70)
+        played_color = QColor("#29B6F6")
+        unplayed_color = QColor(120, 170, 210, 60)
 
         for i in range(n):
             x = int(i * bw)
@@ -535,8 +597,51 @@ class WaveformWidget(QWidget):
 
         # Playhead
         if self._duration > 0:
-            p.setPen(QPen(QColor("#FAC775"), 2))
+            p.setPen(QPen(QColor("#80DEEA"), 2))
             p.drawLine(px, 2, px, h - 2)
+
+
+class AnimatedButton(QToolButton):
+    """Tool button with a soft drop shadow that retracts on press, giving the
+    impression that the button physically depresses into the panel."""
+
+    def __init__(self, parent=None, *,
+                 shadow_color: QColor = QColor(0, 0, 0, 170),
+                 shadow_blur: int = 18,
+                 shadow_offset: int = 4,
+                 glow: bool = False):
+        super().__init__(parent)
+        self._rest_offset = shadow_offset
+        self._rest_blur = shadow_blur
+        self._shadow = QGraphicsDropShadowEffect(self)
+        self._shadow.setBlurRadius(shadow_blur)
+        self._shadow.setColor(shadow_color)
+        self._shadow.setOffset(0, shadow_offset)
+        self.setGraphicsEffect(self._shadow)
+
+        self._anim = QPropertyAnimation(self._shadow, b"offset", self)
+        self._anim.setDuration(110)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+
+        if glow:
+            # Subtle cyan glow for the primary action button.
+            self._shadow.setColor(QColor(41, 182, 246, 180))
+
+    def _animate_to(self, target_y: float) -> None:
+        self._anim.stop()
+        self._anim.setStartValue(self._shadow.offset())
+        self._anim.setEndValue(QPointF(0, target_y))
+        self._anim.start()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.isEnabled():
+            self._animate_to(0)
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._animate_to(self._rest_offset)
+        super().mouseReleaseEvent(e)
 
 
 class DropZone(QFrame):
@@ -593,102 +698,142 @@ class DropZone(QFrame):
 # ============================================================================
 
 APP_QSS = """
-QMainWindow, QWidget#Central { background: #131313; color: #e8e8e8; }
-QLabel { color: #d8d8d8; }
+QMainWindow, QWidget#Central { background: #0A1929; color: #E3F2FD; }
+QLabel { color: #B0D4F1; }
 
-QLabel#Title { color: #BA7517; font-weight: 700; font-size: 16px; letter-spacing: 6px; }
-QLabel#Subtitle { color: #666; font-size: 9px; letter-spacing: 4px; }
-QLabel#SectionLabel { color: #777; font-size: 9px; letter-spacing: 5px; }
+QLabel#Title { color: #4FC3F7; font-weight: 700; font-size: 16px; letter-spacing: 6px; }
+QLabel#Subtitle { color: #5C8AAB; font-size: 9px; letter-spacing: 4px; }
+QLabel#SectionLabel { color: #5C8AAB; font-size: 9px; letter-spacing: 5px; }
 QLabel#Badge {
-    background: #FAC775; color: #412402; font-weight: 700;
-    padding: 2px 8px; border-radius: 3px; font-size: 9px; letter-spacing: 1px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #4FC3F7, stop:1 #29B6F6);
+    color: #062338; font-weight: 700;
+    padding: 3px 10px; border-radius: 6px; font-size: 9px; letter-spacing: 1px;
 }
-QLabel#FileName { color: #ececec; font-size: 13px; }
-QLabel#FileMeta { color: #888; font-size: 10px; }
+QLabel#FileName { color: #ECF6FE; font-size: 13px; }
+QLabel#FileMeta { color: #7AAACF; font-size: 10px; }
 QLabel#Time {
-    color: #FAC775; font-family: 'Consolas', 'Courier New', monospace;
+    color: #4FC3F7; font-family: 'Consolas', 'Courier New', monospace;
     font-size: 14px; min-width: 160px; padding-left: 12px;
 }
-QLabel#StatusLabel { color: #999; font-size: 10px; }
-QLabel#StatusKey { color: #666; font-size: 9px; letter-spacing: 2px; }
+QLabel#StatusLabel { color: #7AAACF; font-size: 10px; }
+QLabel#StatusKey { color: #5C8AAB; font-size: 9px; letter-spacing: 2px; }
 
-QFrame#Card {
-    background: #1c1c1c;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
+QFrame#Card, QFrame#FileCard {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #15324F, stop:1 #10263F);
+    border: 1px solid #1E3A5F;
+    border-radius: 10px;
 }
-QFrame#FileCard {
-    background: #1c1c1c;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
-}
-QFrame#FileCard:hover { border-color: #444; }
+QFrame#FileCard:hover { border-color: #29B6F6; }
 QFrame#DropZone {
-    background: #181818;
-    border: 1px dashed #3a3a3a;
-    border-radius: 6px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #102542, stop:1 #0B1C30);
+    border: 2px dashed #1E4870;
+    border-radius: 12px;
 }
 QFrame#DropZone[dragOver="true"] {
-    border: 1px dashed #EF9F27;
-    background: rgba(239, 159, 39, 14);
+    border: 2px dashed #4FC3F7;
+    background: rgba(41, 182, 246, 30);
 }
-QLabel#DropTitle { color: #888; font-size: 11px; letter-spacing: 4px; }
-QLabel#DropHint { color: #555; font-size: 9px; letter-spacing: 2px; }
+QLabel#DropTitle { color: #90CAF9; font-size: 12px; letter-spacing: 4px; font-weight: 700; }
+QLabel#DropHint { color: #5C8AAB; font-size: 9px; letter-spacing: 2px; }
 
 QFrame#ErrorBox {
-    background: #2b1717; border: 1px solid #5a2222;
-    border-radius: 4px; padding: 6px 10px;
+    background: #3E1B1F; border: 1px solid #6E2C30;
+    border-radius: 8px; padding: 6px 10px;
 }
-QLabel#ErrorText { color: #f3a8a8; font-size: 11px; }
+QLabel#ErrorText { color: #FFB4B8; font-size: 11px; }
 
-QPushButton#Ctrl, QToolButton#Ctrl {
-    background: #1f1f1f; border: 1px solid #2e2e2e;
-    color: #ddd; min-width: 38px; min-height: 38px;
-    border-radius: 4px; font-size: 16px;
+QToolButton#Ctrl {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #2C5680, stop:0.5 #1B3D62, stop:1 #122E4D);
+    border-top: 1px solid #4D7DAE;
+    border-left: 1px solid #2C5680;
+    border-right: 1px solid #2C5680;
+    border-bottom: 1px solid #0A1A2D;
+    color: #DDEEFB;
+    min-width: 42px; min-height: 42px;
+    border-radius: 11px;
+    font-size: 17px;
+    padding: 0px;
+    font-family: 'Segoe UI Symbol', 'Segoe UI', sans-serif;
 }
-QPushButton#Ctrl:hover, QToolButton#Ctrl:hover { border-color: #555; color: #fff; }
-QPushButton#Ctrl:disabled, QToolButton#Ctrl:disabled { color: #444; border-color: #222; }
-QPushButton#PlayBtn {
-    background: #FAC775; border: 1px solid #EF9F27;
-    color: #412402; min-width: 44px; min-height: 44px;
-    border-radius: 4px; font-size: 18px; font-weight: 700;
+QToolButton#Ctrl:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #3B6EA6, stop:0.5 #275387, stop:1 #1A3D62);
+    border-top-color: #6FA0D0;
+    border-left-color: #3B6EA6;
+    border-right-color: #3B6EA6;
+    color: #FFFFFF;
 }
-QPushButton#PlayBtn:hover { background: #EF9F27; border-color: #BA7517; }
+QToolButton#Ctrl:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #122E4D, stop:0.5 #1B3D62, stop:1 #2C5680);
+    border-top: 1px solid #0A1A2D;
+    border-bottom: 1px solid #4D7DAE;
+    padding-top: 1px;
+}
+QToolButton#Ctrl:disabled {
+    background: #0F2238;
+    border-top: 1px solid #1E3A5F;
+    border-left: 1px solid #15314F;
+    border-right: 1px solid #15314F;
+    border-bottom: 1px solid #0A1A2D;
+    color: #2D4A6B;
+}
+
+QToolButton#PlayBtn {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #80DEEA, stop:0.5 #4FC3F7, stop:1 #1A8FCB);
+    border-top: 1px solid #B8EFFB;
+    border-left: 1px solid #4FC3F7;
+    border-right: 1px solid #4FC3F7;
+    border-bottom: 1px solid #015D85;
+    color: #042032;
+    min-width: 56px; min-height: 56px;
+    border-radius: 14px;
+    font-size: 22px; font-weight: 700;
+    font-family: 'Segoe UI Symbol', 'Segoe UI', sans-serif;
+    padding: 0px;
+}
+QToolButton#PlayBtn:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #C5F2FB, stop:0.5 #80DEEA, stop:1 #29B6F6);
+    border-top-color: #E1FAFF;
+}
+QToolButton#PlayBtn:pressed {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #1A8FCB, stop:0.5 #4FC3F7, stop:1 #80DEEA);
+    border-top: 1px solid #015D85;
+    border-bottom: 1px solid #B8EFFB;
+    padding-top: 1px;
+}
 
 QSlider::groove:horizontal {
-    background: #262626; height: 4px; border-radius: 2px;
+    background: #15324F; height: 6px; border-radius: 3px;
 }
 QSlider::sub-page:horizontal {
-    background: #EF9F27; height: 4px; border-radius: 2px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #29B6F6, stop:1 #4FC3F7);
+    height: 6px; border-radius: 3px;
 }
 QSlider::handle:horizontal {
-    background: #FAC775; width: 12px; height: 12px;
-    margin: -4px 0; border-radius: 6px;
+    background: #FFFFFF; width: 14px; height: 14px;
+    margin: -5px 0; border-radius: 8px;
+    border: 2px solid #29B6F6;
 }
-QSlider::handle:horizontal:hover { background: #fff; }
-
-QComboBox, QSpinBox {
-    background: #1a1a1a; border: 1px solid #2c2c2c; color: #ddd;
-    padding: 4px 6px; border-radius: 3px;
-    font-family: 'Consolas', 'Courier New', monospace; font-size: 11px;
-}
-QComboBox:hover, QSpinBox:hover { border-color: #4a4a4a; }
-QComboBox QAbstractItemView {
-    background: #1a1a1a; border: 1px solid #333; color: #ddd;
-    selection-background-color: #EF9F27; selection-color: #1a1a1a;
-}
-QComboBox::drop-down { border: none; }
+QSlider::handle:horizontal:hover { background: #80DEEA; border-color: #4FC3F7; }
 
 QListWidget {
-    background: #161616; border: 1px solid #262626; border-radius: 4px;
-    color: #c0c0c0; font-size: 11px; outline: 0;
+    background: #0E2238; border: 1px solid #1E3A5F; border-radius: 10px;
+    color: #B0D4F1; font-size: 11px; outline: 0;
+    padding: 4px;
 }
-QListWidget::item { padding: 6px 10px; border-bottom: 1px solid #1f1f1f; }
-QListWidget::item:hover { background: #1d1d1d; }
-QListWidget::item:selected { background: #2a1f0d; color: #FAC775; }
+QListWidget::item { padding: 8px 12px; border-radius: 6px; margin: 1px; }
+QListWidget::item:hover { background: #15324F; }
+QListWidget::item:selected {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1A4D7A, stop:1 #2C5A8F);
+    color: #FFFFFF;
+}
 
-QFrame#Divider { background: #262626; max-height: 1px; }
-QFrame#Sep { background: #262626; max-width: 1px; }
+QFrame#Divider { background: #1E3A5F; max-height: 1px; }
 """
 
 
@@ -702,13 +847,15 @@ class MainWindow(QMainWindow):
         self.engine = AudioEngine()
         self.playlist: List[TrackInfo] = []
         self.current_index: int = -1
-        self._suppress_cfg_signals = False
         self._user_seeking = False
 
         self._build_ui()
         self._connect_engine()
         self._install_shortcuts()
         self._update_ui_state()
+        # Sync engine to default UI values (100% volume, 1.0x speed)
+        self.engine.set_volume(self.vol_slider.value() / 100.0)
+        self.engine.set_speed(self.spd_slider.value() / 100.0)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -770,21 +917,24 @@ class MainWindow(QMainWindow):
         self.seek_slider.sliderReleased.connect(self._on_seek_release)
         outer.addWidget(self.seek_slider)
 
-        # Transport controls
-        controls = QHBoxLayout(); controls.setSpacing(8)
+        # Transport controls — all unicode media-control glyphs from the same family
+        # for visual consistency. AnimatedButton gives them depth + press animation.
+        controls = QHBoxLayout(); controls.setSpacing(10)
 
-        self.btn_stop = QToolButton(); self.btn_stop.setText("■"); self.btn_stop.setObjectName("Ctrl")
-        self.btn_stop.setToolTip("Stop  (Esc)")
-        self.btn_prev = QToolButton(); self.btn_prev.setText("⏮"); self.btn_prev.setObjectName("Ctrl")
-        self.btn_prev.setToolTip("Previous  (Ctrl+←)")
-        self.btn_play = QPushButton("▶"); self.btn_play.setObjectName("PlayBtn")
+        def ctrl(text: str, tip: str) -> AnimatedButton:
+            b = AnimatedButton()
+            b.setText(text); b.setObjectName("Ctrl"); b.setToolTip(tip)
+            return b
+
+        self.btn_stop  = ctrl("⏹", "Stop  (Esc)")              # ⏹
+        self.btn_back5 = ctrl("⏪", "Back 5s  (←)")        # ⏪
+        self.btn_prev  = ctrl("⏮", "Previous  (Ctrl+←)")  # ⏮
+        self.btn_play  = AnimatedButton(glow=True, shadow_blur=28, shadow_offset=5)
+        self.btn_play.setText("▶")                              # ▶
+        self.btn_play.setObjectName("PlayBtn")
         self.btn_play.setToolTip("Play / Pause  (Space)")
-        self.btn_next = QToolButton(); self.btn_next.setText("⏭"); self.btn_next.setObjectName("Ctrl")
-        self.btn_next.setToolTip("Next  (Ctrl+→)")
-        self.btn_back5 = QToolButton(); self.btn_back5.setText("«5"); self.btn_back5.setObjectName("Ctrl")
-        self.btn_back5.setToolTip("Back 5s  (←)")
-        self.btn_fwd5 = QToolButton(); self.btn_fwd5.setText("5»"); self.btn_fwd5.setObjectName("Ctrl")
-        self.btn_fwd5.setToolTip("Forward 5s  (→)")
+        self.btn_next  = ctrl("⏭", "Next  (Ctrl+→)")      # ⏭
+        self.btn_fwd5  = ctrl("⏩", "Forward 5s  (→)")     # ⏩
 
         self.btn_stop.clicked.connect(self.engine.stop)
         self.btn_play.clicked.connect(self.engine.toggle_play)
@@ -801,71 +951,36 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.time_lbl)
         controls.addStretch()
 
-        controls.addWidget(QLabel("VOL"))
-        self.vol_slider = QSlider(Qt.Horizontal)
-        self.vol_slider.setRange(0, 100); self.vol_slider.setValue(85)
-        self.vol_slider.setFixedWidth(110)
-        self.vol_slider.valueChanged.connect(self._on_volume)
-        controls.addWidget(self.vol_slider)
-        self.vol_pct = QLabel("85%"); self.vol_pct.setObjectName("StatusLabel"); self.vol_pct.setMinimumWidth(34)
-        controls.addWidget(self.vol_pct)
-
         outer.addLayout(controls)
+
+        # Speed + Volume row (sliders for fine control)
+        sliders = QHBoxLayout(); sliders.setSpacing(10)
+        spd_lbl = QLabel("SPEED"); spd_lbl.setObjectName("StatusKey")
+        self.spd_slider = QSlider(Qt.Horizontal)
+        self.spd_slider.setRange(50, 250)   # 0.50x .. 2.50x
+        self.spd_slider.setValue(100)
+        self.spd_slider.setFixedWidth(140)
+        self.spd_slider.valueChanged.connect(self._on_speed)
+        self.spd_pct = QLabel("1.00x"); self.spd_pct.setObjectName("StatusLabel"); self.spd_pct.setMinimumWidth(40)
+        # Double-click on the speed slider resets to 1.0x
+        self.spd_slider.mouseDoubleClickEvent = lambda _e: self.spd_slider.setValue(100)
+
+        sliders.addWidget(spd_lbl); sliders.addWidget(self.spd_slider); sliders.addWidget(self.spd_pct)
+        sliders.addStretch()
+
+        vol_lbl = QLabel("VOL"); vol_lbl.setObjectName("StatusKey")
+        self.vol_slider = QSlider(Qt.Horizontal)
+        self.vol_slider.setRange(0, 100); self.vol_slider.setValue(100)
+        self.vol_slider.setFixedWidth(140)
+        self.vol_slider.valueChanged.connect(self._on_volume)
+        self.vol_pct = QLabel("100%"); self.vol_pct.setObjectName("StatusLabel"); self.vol_pct.setMinimumWidth(40)
+        sliders.addWidget(vol_lbl); sliders.addWidget(self.vol_slider); sliders.addWidget(self.vol_pct)
+
+        outer.addLayout(sliders)
 
         # Divider
         d1 = QFrame(); d1.setObjectName("Divider"); d1.setFrameShape(QFrame.HLine); d1.setFixedHeight(1)
         outer.addWidget(d1)
-
-        # Format Parameters
-        fmt_lbl = QLabel("FORMAT PARAMETERS"); fmt_lbl.setObjectName("SectionLabel")
-        outer.addWidget(fmt_lbl)
-
-        grid = QGridLayout(); grid.setHorizontalSpacing(10); grid.setVerticalSpacing(6)
-
-        def field_label(text):
-            l = QLabel(text); l.setObjectName("StatusKey"); return l
-
-        # Sample rate
-        self.cfg_sr = QComboBox()
-        for v in [8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 192000]:
-            self.cfg_sr.addItem(f"{v} Hz", v)
-        # Channels
-        self.cfg_ch = QComboBox()
-        for v in [1, 2, 4, 6, 8]:
-            label = "1 (Mono)" if v == 1 else "2 (Stereo)" if v == 2 else f"{v} ch"
-            self.cfg_ch.addItem(label, v)
-        # Bit depth
-        self.cfg_bd = QComboBox()
-        for v in [8, 16, 24, 32, 64]:
-            self.cfg_bd.addItem(f"{v}-bit", v)
-        # Encoding
-        self.cfg_enc = QComboBox()
-        for k, l in [("signed", "Signed Int"), ("unsigned", "Unsigned Int"), ("float", "Float")]:
-            self.cfg_enc.addItem(l, k)
-        # Endian
-        self.cfg_end = QComboBox()
-        for k, l in [("le", "Little Endian"), ("be", "Big Endian")]:
-            self.cfg_end.addItem(l, k)
-        # Header offset
-        self.cfg_off = QSpinBox()
-        self.cfg_off.setRange(0, 10_000_000); self.cfg_off.setSingleStep(1)
-
-        widgets = [
-            ("SAMPLE RATE", self.cfg_sr),
-            ("CHANNELS",    self.cfg_ch),
-            ("BIT DEPTH",   self.cfg_bd),
-            ("ENCODING",    self.cfg_enc),
-            ("BYTE ORDER",  self.cfg_end),
-            ("HEADER SKIP", self.cfg_off),
-        ]
-        for col, (lbl, w) in enumerate(widgets):
-            grid.addWidget(field_label(lbl), 0, col)
-            grid.addWidget(w, 1, col)
-        outer.addLayout(grid)
-
-        for combo in (self.cfg_sr, self.cfg_ch, self.cfg_bd, self.cfg_enc, self.cfg_end):
-            combo.currentIndexChanged.connect(self._on_cfg_changed)
-        self.cfg_off.valueChanged.connect(self._on_cfg_changed)
 
         # Status bar
         self.status_lbl = QLabel("")
@@ -1045,7 +1160,7 @@ class MainWindow(QMainWindow):
         self.time_lbl.setText(f"{_fmt_time(self.engine.position)} / {_fmt_time(dur)}")
 
     def _on_state(self, s: str):
-        self.btn_play.setText("❚❚" if s == "playing" else "▶")
+        self.btn_play.setText("⏸" if s == "playing" else "▶")
 
     def _on_track_loaded(self, track: TrackInfo):
         self.error_box.hide()
@@ -1060,23 +1175,6 @@ class MainWindow(QMainWindow):
             f"{track.channels} ch  ·  {track.bit_depth}-bit  ·  "
             f"{track.encoding.upper()}  ·  {track.endian.upper()}"
         )
-
-        # Sync format combos to current track without re-triggering reloads.
-        self._suppress_cfg_signals = True
-        try:
-            _set_combo_data(self.cfg_sr, track.sample_rate)
-            _set_combo_data(self.cfg_ch, track.channels)
-            _set_combo_data(self.cfg_bd, track.bit_depth)
-            _set_combo_data(self.cfg_enc, track.encoding)
-            _set_combo_data(self.cfg_end, track.endian)
-            self.cfg_off.setValue(track.data_offset)
-        finally:
-            self._suppress_cfg_signals = False
-
-        # Disable raw-PCM controls for files where format is fixed by header.
-        is_raw = track.detected_type in ("pcm", "raw")
-        for w in (self.cfg_sr, self.cfg_ch, self.cfg_bd, self.cfg_enc, self.cfg_end, self.cfg_off):
-            w.setEnabled(is_raw)
 
         # Compute waveform peaks on a worker thread so the UI stays responsive.
         self.waveform.set_loading(True)
@@ -1117,29 +1215,17 @@ class MainWindow(QMainWindow):
         self.engine.set_volume(v / 100.0)
         self.vol_pct.setText(f"{v}%")
 
+    def _on_speed(self, v: int):
+        speed = v / 100.0
+        self.engine.set_speed(speed)
+        self.spd_pct.setText(f"{speed:.2f}x")
+
     def _on_seek_release(self):
         self._user_seeking = False
         if self.engine.duration <= 0:
             return
         ratio = self.seek_slider.value() / 1000.0
         self.engine.seek(ratio * self.engine.duration)
-
-    def _on_cfg_changed(self, *_):
-        if self._suppress_cfg_signals:
-            return
-        if self.current_index < 0:
-            return
-        track = self.playlist[self.current_index]
-        # Only meaningful for raw PCM
-        if track.detected_type not in ("pcm", "raw"):
-            return
-        track.sample_rate = self.cfg_sr.currentData() or track.sample_rate
-        track.channels = self.cfg_ch.currentData() or track.channels
-        track.bit_depth = self.cfg_bd.currentData() or track.bit_depth
-        track.encoding = self.cfg_enc.currentData() or track.encoding
-        track.endian = self.cfg_end.currentData() or track.endian
-        track.data_offset = int(self.cfg_off.value())
-        self.engine.reload_with(track)
 
 
 # ============================================================================
@@ -1157,23 +1243,28 @@ def _fmt_bytes(n: int) -> str:
     if n >= 1024:      return f"{n/1024:.1f} KB"
     return f"{n} B"
 
-def _set_combo_data(combo: QComboBox, value):
-    for i in range(combo.count()):
-        if combo.itemData(i) == value:
-            combo.setCurrentIndex(i)
-            return
-
-
 # ============================================================================
 # Entry point
 # ============================================================================
 
 def main():
-    QApplication.setStyle(QStyleFactory.create("Fusion"))
+    # Make Windows show our icon in the taskbar (otherwise it groups under python.exe).
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("br.com.tributodevido.pcmplayer")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     app.setApplicationName("PCM Player")
     app.setOrganizationName("Tributo Devido")
     app.setStyleSheet(APP_QSS)
+
+    icon_path = _resource_path("icon.ico")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
 
     win = MainWindow()
     win.show()
