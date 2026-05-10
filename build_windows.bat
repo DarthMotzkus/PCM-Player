@@ -32,15 +32,20 @@ echo [3/4] Building portable single-file executable ...
 REM Using --onefile produces ONE PCMPlayer.exe that unpacks to a temp dir on launch.
 REM --windowed hides the console window (it's a GUI app).
 REM --noconfirm overwrites previous builds without prompting.
+REM --collect-all bundles ALL submodules + binaries + data of these libs (including
+REM   the native libsndfile / portaudio DLLs they need at runtime).
+REM Set DEBUG=1 before calling this script to keep the console visible for diagnostics.
+set "WINDOW_FLAG=--windowed"
+if /i "%DEBUG%"=="1" set "WINDOW_FLAG=--console"
+
 pyinstaller ^
   --noconfirm ^
   --clean ^
   --onefile ^
-  --windowed ^
+  %WINDOW_FLAG% ^
   --name "PCMPlayer" ^
-  --collect-binaries sounddevice ^
-  --collect-binaries soundfile ^
-  --collect-data soundfile ^
+  --collect-all sounddevice ^
+  --collect-all soundfile ^
   pcm_player.py || goto :fail
 
 echo.

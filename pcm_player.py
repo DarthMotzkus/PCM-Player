@@ -23,13 +23,47 @@ import io
 import os
 import sys
 import threading
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import numpy as np
-import sounddevice as sd
-import soundfile as sf
+
+def _crash_log_path() -> str:
+    # Write next to the executable when frozen; otherwise next to the script.
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "pcm_player_error.log")
+
+
+def _log_fatal(prefix: str, exc: BaseException) -> None:
+    try:
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
+            f.write(f"=== {prefix} ===\n")
+            f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            f.write("\n")
+    except Exception:
+        pass
+
+
+def _excepthook(exctype, value, tb):
+    try:
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
+            f.write("=== Uncaught exception ===\n")
+            f.write("".join(traceback.format_exception(exctype, value, tb)))
+            f.write("\n")
+    except Exception:
+        pass
+
+
+sys.excepthook = _excepthook
+
+try:
+    import numpy as np
+    import sounddevice as sd
+    import soundfile as sf
+except Exception as _e:
+    _log_fatal("Import failure", _e)
+    raise
 
 from PySide6.QtCore import (
     QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal, QObject, QEvent
@@ -1154,4 +1188,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as _e:
+        _log_fatal("main() crashed", _e)
+        raise
