@@ -1,3 +1,38 @@
+# PCM Player v1.2
+
+Right-click integration overhaul, repeat modes, waveform-as-timeline with click + drag seeking, a slim progress strip below the waveform, a centered cluster of volume + speed controls, and a long list of fixes around the file-handoff path.
+
+## What's new
+
+- **Single-instance** — only one PCMPlayer window can be open at a time. Any extra launches (e.g. when Explorer falls back to one-process-per-file for multi-select) hand their argv to the existing window over a `QLocalServer` socket and exit immediately. The running window appends the incoming files to its playlist and brings itself to the front.
+- **Folder context menu** — the install now registers the verb in three places:
+  - any **file** (`*\shell`)
+  - any **folder** (`Directory\shell`) — right-click a folder to queue every audio file inside it
+  - the **folder background** (`Directory\Background\shell`) — right-click empty space inside an open folder, same effect
+  - In all cases the player scans the folder non-recursively, filters by known audio extensions, sorts case-insensitively, and queues the result.
+- **Repeat button** with a 3-state cycle: **off → repeat one track → repeat playlist → off**. The button is highlighted with the accent color when active and shows a small `¹` superscript in repeat-one mode.
+- **Waveform is the timeline** — click anywhere on the song shape to jump, drag to scrub. Drag is throttled to ~12 Hz so the audio stream doesn't churn. Played portion is rendered in the theme accent, unplayed portion in a dimmed accent so the song shape stays readable from position 0.
+- **Slim progress strip** sits directly below the waveform — a 4 px tall accent-gradient bar that fills as the song plays and supports click-to-seek (custom `ClickableSlider`, no draggable knob, just a visual indicator).
+- **Speed controls demoted and centered** — no more big "SPEED" label. The `1.00x` value plus tiny `−` / `+` / `⟲` steppers sit right next to the volume slider in a single centered cluster. Double-click the value to reset to 1.00×.
+
+## Fixed
+
+- **Peaks computation never reached the GUI** — `compute_peaks` ran successfully in the worker thread but the `QTimer.singleShot` we used to hop back to the main thread silently failed to marshal, leaving the waveform stuck on its empty/loading state. Replaced with a proper `Signal` + queued connection, which Qt routes cross-thread automatically.
+- Selecting many files in Explorer and choosing *Play with PCM-Player* would open one player per file instead of one playlist. Even with `MultiSelectModel="Player"` set, Windows can still split the invocation in some scenarios (e.g. mixed selections, slow shell handlers); the new single-instance guard makes the result a single window with the full list every time.
+- *Previous* / *Next* transport buttons stayed disabled when files were added to the playlist mid-playback. They now wake up the moment the playlist reaches more than one item, regardless of how the items got there.
+- The right-click verb wasn't visible on folders at all — only on individual files.
+- `MainWindow._update_ui_state` referenced `btn_back5` / `btn_fwd5` after those buttons were removed in v1.1, crashing the app on startup of any packaged build that hit `_update_ui_state`.
+
+## Download
+
+Grab the `PCMPlayer.exe` from the assets below — no installation required. The right-click integration is one click away in the gear menu.
+
+## Requirements
+
+- Windows 10/11
+
+---
+
 # PCM Player v1.1
 
 UI redesign with switchable themes, brushed-metal transport buttons, real-time speed control, and one-click Windows context-menu integration.

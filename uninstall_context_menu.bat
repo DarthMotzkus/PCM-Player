@@ -1,12 +1,9 @@
 @echo off
-REM Removes the "Play with PCM-Player" entry from the right-click menu.
-reg delete "HKCU\Software\Classes\*\shell\PlayWithPCMPlayer" /f >nul 2>&1
-if %errorlevel%==0 (
-    echo.
-    echo  Removed: "Play with PCM-Player" is gone from the right-click menu.
-) else (
-    echo.
-    echo  Nothing to remove ^(the entry was not registered^).
-)
+REM Removes "Play with PCM-Player" from file, folder and folder-background menus.
+reg delete "HKCU\Software\Classes\*\shell\PlayWithPCMPlayer"                   /f >nul 2>&1
+reg delete "HKCU\Software\Classes\Directory\shell\PlayWithPCMPlayer"           /f >nul 2>&1
+reg delete "HKCU\Software\Classes\Directory\Background\shell\PlayWithPCMPlayer" /f >nul 2>&1
+echo.
+echo  Removed (if it was there): "Play with PCM-Player" entries.
 echo.
 pause

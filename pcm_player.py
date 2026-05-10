@@ -114,7 +114,11 @@ def _save_settings(data: dict) -> None:
 # Per-user (HKCU), no admin required. Multi-select aware via MultiSelectModel.
 # -----------------------------------------------------------------------------
 
-_CTXMENU_KEY = r"Software\Classes\*\shell\PlayWithPCMPlayer"
+# Three registry locations: files (any extension), folders (right-click on a
+# folder), and the folder background (right-click inside an open folder).
+_CTXMENU_KEY_FILE   = r"Software\Classes\*\shell\PlayWithPCMPlayer"
+_CTXMENU_KEY_DIR    = r"Software\Classes\Directory\shell\PlayWithPCMPlayer"
+_CTXMENU_KEY_DIR_BG = r"Software\Classes\Directory\Background\shell\PlayWithPCMPlayer"
 
 
 def _ctxmenu_supported() -> bool:
@@ -127,7 +131,7 @@ def _ctxmenu_is_installed() -> bool:
         return False
     try:
         import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _CTXMENU_KEY):
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _CTXMENU_KEY_FILE):
             return True
     except (OSError, FileNotFoundError):
         return False
@@ -139,12 +143,21 @@ def _ctxmenu_install() -> bool:
     try:
         import winreg
         exe = sys.executable
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _CTXMENU_KEY) as k:
-            winreg.SetValue(k, "", winreg.REG_SZ, "Play with PCM-Player")
-            winreg.SetValueEx(k, "Icon", 0, winreg.REG_SZ, f'"{exe}",0')
-            winreg.SetValueEx(k, "MultiSelectModel", 0, winreg.REG_SZ, "Player")
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _CTXMENU_KEY + r"\command") as k:
-            winreg.SetValue(k, "", winreg.REG_SZ, f'"{exe}" %1')
+
+        def _write_verb(key_path: str, command_value: str):
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as k:
+                winreg.SetValue(k, "", winreg.REG_SZ, "Play with PCM-Player")
+                winreg.SetValueEx(k, "Icon", 0, winreg.REG_SZ, f'"{exe}",0')
+                winreg.SetValueEx(k, "MultiSelectModel", 0, winreg.REG_SZ, "Player")
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path + r"\command") as k:
+                winreg.SetValue(k, "", winreg.REG_SZ, command_value)
+
+        # Files: %1 receives the (possibly multi-select) list of file paths.
+        _write_verb(_CTXMENU_KEY_FILE, f'"{exe}" %1')
+        # Folders (right-click on a folder): %1 is the folder path.
+        _write_verb(_CTXMENU_KEY_DIR,  f'"{exe}" %1')
+        # Folder background (right-click inside an open folder): %V is the cwd.
+        _write_verb(_CTXMENU_KEY_DIR_BG, f'"{exe}" "%V"')
         return True
     except Exception:
         return False
@@ -155,16 +168,24 @@ def _ctxmenu_uninstall() -> bool:
         return False
     try:
         import winreg
-        try:
-            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _CTXMENU_KEY + r"\command")
-        except FileNotFoundError:
-            pass
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _CTXMENU_KEY)
-        return True
-    except FileNotFoundError:
-        return False
     except Exception:
         return False
+    removed_any = False
+    for parent in (_CTXMENU_KEY_FILE, _CTXMENU_KEY_DIR, _CTXMENU_KEY_DIR_BG):
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, parent + r"\command")
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, parent)
+            removed_any = True
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    return removed_any
 
 
 import numpy as np
@@ -188,6 +209,7 @@ from PySide6.QtWidgets import (
     QMenu, QMessageBox, QPushButton, QSizePolicy, QSlider,
     QStyleFactory, QToolButton, QVBoxLayout, QWidget,
 )
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 # ============================================================================
 # Audio data model and decoding
@@ -234,6 +256,37 @@ SUPPORTED_EXTENSIONS = (
     "*.pcm *.raw *.bin *.dat *.s8 *.s16 *.s24 *.s32 *.u8 *.f32 *.f64 "
     "*.s16le *.s16be *.s24le *.s24be *.s32le *.s32be *.f32le *.f32be"
 )
+
+_AUDIO_EXTS = frozenset(
+    s.lstrip("*.").lower()
+    for s in SUPPORTED_EXTENSIONS.split() if s.startswith("*.")
+)
+
+
+def _is_audio_file(path: str) -> bool:
+    return os.path.splitext(path)[1].lstrip(".").lower() in _AUDIO_EXTS
+
+
+def _expand_args_to_files(args) -> List[str]:
+    """Resolve a list of CLI arguments into a flat list of audio files. Folders
+    are scanned (non-recursively, sorted case-insensitively) for files whose
+    extension matches a known audio format. Used so the right-click menu can
+    target a folder and the player automatically queues its audio contents."""
+    out: List[str] = []
+    for a in args:
+        if not a:
+            continue
+        if os.path.isfile(a):
+            out.append(a)
+        elif os.path.isdir(a):
+            try:
+                for f in sorted(os.listdir(a), key=str.lower):
+                    full = os.path.join(a, f)
+                    if os.path.isfile(full) and _is_audio_file(full):
+                        out.append(full)
+            except Exception:
+                pass
+    return out
 
 
 @dataclass
@@ -609,27 +662,32 @@ class WaveformWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(96)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMinimumHeight(110)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setCursor(Qt.PointingHandCursor)
         self._peaks: Optional[np.ndarray] = None
         self._duration: float = 0.0
         self._position: float = 0.0
         self._loading = False
         self._empty_text = "NO FILE LOADED"
+        self._dragging = False
+        self._last_seek_pos = -1.0
         self.apply_theme(THEMES[DEFAULT_THEME])
 
     def apply_theme(self, t: dict):
         self._wf_bg_top = QColor(t["drop_bg_top"])
         self._wf_bg_bot = QColor(t["drop_bg_bot"])
         self._wf_border = QColor(t["border"])
+        # Played: bright accent. Unplayed: same accent dimmed but still
+        # clearly visible — at position 0 every bar is "unplayed", so this
+        # alpha decides whether the song shape is readable at all.
         self._wf_played = QColor(t["accent"])
-        self._wf_unplayed = QColor(t["text_label"])
-        self._wf_unplayed.setAlpha(70)
+        self._wf_unplayed = QColor(t["accent"])
+        self._wf_unplayed.setAlpha(95)
         self._wf_playhead = QColor(t["accent_glow"])
         self._wf_text = QColor(t["text_label"])
         self._wf_centerline = QColor(t["text_mute"])
-        self._wf_centerline.setAlpha(40)
+        self._wf_centerline.setAlpha(35)
         self.update()
 
     def set_loading(self, loading: bool):
@@ -645,10 +703,33 @@ class WaveformWidget(QWidget):
         self._position = float(seconds)
         self.update()
 
+    def _seek_from_x(self, x: float, throttle: bool = False) -> None:
+        if self._duration <= 0 or self._peaks is None:
+            return
+        ratio = max(0.0, min(1.0, x / max(1, self.width())))
+        target = ratio * self._duration
+        if throttle and abs(target - self._last_seek_pos) < 0.08:
+            return
+        self._last_seek_pos = target
+        self._position = target  # paint immediately for responsiveness
+        self.update()
+        self.seek_requested.emit(target)
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and self._duration > 0 and self._peaks is not None:
-            ratio = max(0.0, min(1.0, event.position().x() / max(1, self.width())))
-            self.seek_requested.emit(ratio * self._duration)
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._seek_from_x(event.position().x())
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and (event.buttons() & Qt.LeftButton):
+            # Throttle to ~12 Hz so the audio engine isn't churning the stream
+            # 60 times per second while the user drags across the waveform.
+            self._seek_from_x(event.position().x(), throttle=True)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            self._seek_from_x(event.position().x())
 
     def paintEvent(self, _event):
         p = QPainter(self)
@@ -669,13 +750,17 @@ class WaveformWidget(QWidget):
         p.drawLine(0, h // 2, w, h // 2)
 
         if self._peaks is None or self._peaks.size == 0:
-            p.setPen(self._wf_text)
-            font = p.font()
-            font.setPointSize(9)
-            font.setLetterSpacing(QFont.PercentageSpacing, 120)
-            p.setFont(font)
-            text = "DECODING…" if self._loading else self._empty_text
-            p.drawText(self.rect(), Qt.AlignCenter, text)
+            # While peaks are being computed (short window for typical files),
+            # leave the area empty — just the gradient + centerline. The real
+            # song waveform replaces this as soon as compute_peaks returns.
+            # Only show the placeholder text when no file is loaded at all.
+            if not self._loading:
+                p.setPen(self._wf_text)
+                font = p.font()
+                font.setPointSize(9)
+                font.setLetterSpacing(QFont.PercentageSpacing, 120)
+                p.setFont(font)
+                p.drawText(self.rect(), Qt.AlignCenter, self._empty_text)
             return
 
         n = self._peaks.size
@@ -694,6 +779,7 @@ class WaveformWidget(QWidget):
         if self._duration > 0:
             p.setPen(QPen(self._wf_playhead, 2))
             p.drawLine(px, 2, px, h - 2)
+
 
 
 class AnimatedButton(QToolButton):
@@ -1115,6 +1201,25 @@ QSlider::handle:horizontal {
 }
 QSlider::handle:horizontal:hover { background: $accent_glow; border-color: $accent_hi; }
 
+/* Slim progress bar that sits right below the waveform — no draggable knob,
+ * just a thin filled track that acts as the song's progress indicator. */
+QSlider#Progress::groove:horizontal {
+    background: $card_bot;
+    height: 4px;
+    border-radius: 2px;
+}
+QSlider#Progress::sub-page:horizontal {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 $accent, stop:1 $accent_glow);
+    height: 4px;
+    border-radius: 2px;
+}
+QSlider#Progress::handle:horizontal {
+    background: transparent;
+    border: none;
+    width: 0;
+    margin: 0;
+}
+
 QListWidget {
     background: $list_bg; border: 1px solid $border; border-radius: 10px;
     color: $text_dim; font-size: 11px; outline: 0;
@@ -1150,6 +1255,20 @@ QFrame#Divider {
     min-height: 1px;
     max-height: 1px;
 }
+
+/* Repeat button: a property selector lights it up when in mode 1 (one) or 2 (all). */
+QToolButton#Ctrl[repeatActive="true"] {
+    color: $accent_hi;
+    border-color: $accent;
+}
+
+QLabel#SpeedValue {
+    color: $text_dim;
+    font-family: 'Consolas','Courier New',monospace;
+    font-size: 11px;
+}
+QLabel#SpeedValue:hover { color: $accent_hi; }
+
 """)
 
 
@@ -1167,7 +1286,35 @@ def _parse_rgba(s: str) -> QColor:
     return QColor(*parts)
 
 
+class ClickableSlider(QSlider):
+    """A QSlider that jumps to the click position on press (default Qt
+    behavior is to step by a page; we want click-to-seek)."""
+    seek_ratio = Signal(float)   # 0.0..1.0 of the slider range
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.maximum() > self.minimum():
+            ratio = max(0.0, min(1.0, event.position().x() / max(1, self.width())))
+            self.setValue(int(self.minimum() + ratio * (self.maximum() - self.minimum())))
+            self.seek_ratio.emit(ratio)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton and self.maximum() > self.minimum():
+            ratio = max(0.0, min(1.0, event.position().x() / max(1, self.width())))
+            self.setValue(int(self.minimum() + ratio * (self.maximum() - self.minimum())))
+            self.seek_ratio.emit(ratio)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+
 class MainWindow(QMainWindow):
+    # Cross-thread delivery: the worker thread emits this when peaks finish,
+    # Qt routes the call back to the GUI thread automatically.
+    _peaks_ready = Signal(object, float)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PCM Player")
@@ -1177,7 +1324,6 @@ class MainWindow(QMainWindow):
         self.engine = AudioEngine()
         self.playlist: List[TrackInfo] = []
         self.current_index: int = -1
-        self._user_seeking = False
 
         self._theme_key: str = DEFAULT_THEME
         self._build_ui()
@@ -1262,23 +1408,24 @@ class MainWindow(QMainWindow):
         eb.addWidget(self.error_lbl, 1)
         outer.addWidget(self.error_box); self.error_box.hide()
 
-        # Waveform
+        # Waveform — also serves as the song-shape seek bar (click + drag).
         self.waveform = WaveformWidget()
         self.waveform.seek_requested.connect(self.engine.seek)
         outer.addWidget(self.waveform)
 
-        # Seek slider
-        self.seek_slider = QSlider(Qt.Horizontal)
-        self.seek_slider.setRange(0, 1000)
-        self.seek_slider.setValue(0)
-        self.seek_slider.sliderPressed.connect(lambda: setattr(self, "_user_seeking", True))
-        self.seek_slider.sliderReleased.connect(self._on_seek_release)
-        outer.addWidget(self.seek_slider)
+        # Slim progress bar directly below the waveform. Even when peaks
+        # haven't been computed (or fail), this gives an unambiguous
+        # "where am I in the song" indicator and supports click-to-seek
+        # natively (we override mousePress to jump on click, not just drag).
+        self.progress = ClickableSlider(Qt.Horizontal)
+        self.progress.setObjectName("Progress")
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(0)
+        self.progress.setFixedHeight(14)
+        self.progress.seek_ratio.connect(self._on_progress_seek)
+        outer.addWidget(self.progress)
 
-        # Transport controls — same Unicode media-control family for consistency.
-        # The row stays centered when the window is wide via stretches on both
-        # sides; on a narrow window the stretches collapse and the controls
-        # take the natural width.
+        # Transport row — centered with stretches on both sides.
         controls = QHBoxLayout(); controls.setSpacing(10)
 
         def ctrl(text: str, tip: str) -> AnimatedButton:
@@ -1287,17 +1434,20 @@ class MainWindow(QMainWindow):
             return b
 
         def ctrl_small(text: str, tip: str) -> AnimatedButton:
-            b = AnimatedButton(shadow_blur=10, shadow_offset=2)
+            b = AnimatedButton(shadow_blur=8, shadow_offset=2)
             b.setText(text); b.setObjectName("CtrlSmall"); b.setToolTip(tip)
             return b
 
-        self.btn_stop  = ctrl("⏹", "Stop  (Esc)")
-        self.btn_prev  = ctrl("⏮", "Previous  (Ctrl+←)")
-        self.btn_play  = AnimatedButton(glow=True, shadow_blur=24, shadow_offset=5)
+        self.btn_stop   = ctrl("⏹", "Stop  (Esc)")
+        self.btn_prev   = ctrl("⏮", "Previous  (Ctrl+←)")
+        self.btn_play   = AnimatedButton(glow=True, shadow_blur=24, shadow_offset=5)
         self.btn_play.setText("▶")
         self.btn_play.setObjectName("PlayBtn")
         self.btn_play.setToolTip("Play / Pause  (Space)")
-        self.btn_next  = ctrl("⏭", "Next  (Ctrl+→)")
+        self.btn_next   = ctrl("⏭", "Next  (Ctrl+→)")
+        self.btn_repeat = ctrl("↻", "Repeat: off")
+        self._repeat_mode = 0  # 0=off, 1=one, 2=all
+        self.btn_repeat.clicked.connect(self._cycle_repeat)
 
         self.btn_stop.clicked.connect(self.engine.stop)
         self.btn_play.clicked.connect(self.engine.toggle_play)
@@ -1305,7 +1455,7 @@ class MainWindow(QMainWindow):
         self.btn_next.clicked.connect(self.next_track)
 
         controls.addStretch(1)
-        for w in (self.btn_stop, self.btn_prev, self.btn_play, self.btn_next):
+        for w in (self.btn_stop, self.btn_prev, self.btn_play, self.btn_next, self.btn_repeat):
             controls.addWidget(w)
         self.time_lbl = QLabel("0:00.00 / 0:00.00"); self.time_lbl.setObjectName("Time")
         controls.addWidget(self.time_lbl)
@@ -1313,49 +1463,48 @@ class MainWindow(QMainWindow):
 
         outer.addLayout(controls)
 
-        # Speed + Volume row, also centered.
+        # Volume in the middle, speed compact in the far-right corner.
         sliders = QHBoxLayout(); sliders.setSpacing(6)
 
         self._speed: float = 1.0
-        spd_lbl = QLabel("SPEED"); spd_lbl.setObjectName("StatusKey")
-        self.btn_spd_minus = ctrl_small("−", "Slower (-0.05x)")
-        self.btn_spd_minus.clicked.connect(lambda: self._speed_step(-0.05))
-        self.spd_pct = QLabel("1.00x"); self.spd_pct.setObjectName("StatusLabel")
-        self.spd_pct.setMinimumWidth(48); self.spd_pct.setAlignment(Qt.AlignCenter)
-        self.spd_pct.setStyleSheet("font-family: 'Consolas','Courier New',monospace; font-size: 11px;")
-        self.btn_spd_plus = ctrl_small("+", "Faster (+0.05x)")
-        self.btn_spd_plus.clicked.connect(lambda: self._speed_step(0.05))
-        self.btn_spd_reset = ctrl_small("⟲", "Reset to 1.00x")
-        self.btn_spd_reset.clicked.connect(lambda: self._speed_set(1.0))
-
-        sliders.addStretch(1)
-        sliders.addWidget(spd_lbl)
-        sliders.addSpacing(4)
-        sliders.addWidget(self.btn_spd_minus)
-        sliders.addWidget(self.spd_pct)
-        sliders.addWidget(self.btn_spd_plus)
-        sliders.addSpacing(2)
-        sliders.addWidget(self.btn_spd_reset)
-        sliders.addSpacing(24)
-
         vol_lbl = QLabel("VOL"); vol_lbl.setObjectName("StatusKey")
         self.vol_slider = QSlider(Qt.Horizontal)
         self.vol_slider.setRange(0, 100); self.vol_slider.setValue(100)
-        self.vol_slider.setFixedWidth(140)
+        self.vol_slider.setFixedWidth(160)
         self.vol_slider.valueChanged.connect(self._on_volume)
         self.vol_pct = QLabel("100%"); self.vol_pct.setObjectName("StatusLabel"); self.vol_pct.setMinimumWidth(36)
+
+        # Compact speed corner — small text + tiny stepper buttons, no big SPEED label.
+        self.spd_pct = QLabel("1.00x"); self.spd_pct.setObjectName("SpeedValue")
+        self.spd_pct.setMinimumWidth(40); self.spd_pct.setAlignment(Qt.AlignCenter)
+        self.spd_pct.setToolTip("Playback speed — double-click to reset")
+        self.btn_spd_minus = ctrl_small("−", "Slower (-0.05x)")
+        self.btn_spd_minus.clicked.connect(lambda: self._speed_step(-0.05))
+        self.btn_spd_plus  = ctrl_small("+", "Faster (+0.05x)")
+        self.btn_spd_plus.clicked.connect(lambda: self._speed_step(0.05))
+        self.btn_spd_reset = ctrl_small("⟲", "Reset to 1.00x")
+        self.btn_spd_reset.clicked.connect(lambda: self._speed_set(1.0))
+        # Allow double-clicking the value label to reset speed
+        self.spd_pct.mouseDoubleClickEvent = lambda _e: self._speed_set(1.0)
+
+        # One single, centered group: VOL slider + speed stepper sit side by
+        # side with a slim divider between them. Stretches on both ends keep
+        # the cluster centered when the window is wide.
+        sliders.addStretch(1)
         sliders.addWidget(vol_lbl)
-        sliders.addSpacing(4)
+        sliders.addSpacing(6)
         sliders.addWidget(self.vol_slider)
         sliders.addWidget(self.vol_pct)
+        sliders.addSpacing(20)
+        sliders.addWidget(self.spd_pct)
+        sliders.addSpacing(4)
+        sliders.addWidget(self.btn_spd_minus)
+        sliders.addWidget(self.btn_spd_plus)
+        sliders.addSpacing(4)
+        sliders.addWidget(self.btn_spd_reset)
         sliders.addStretch(1)
 
         outer.addLayout(sliders)
-
-        # Thin separator (no QFrame.HLine — that draws a hard system-themed
-        # etched line on top of our QSS styling, which looked unnatural).
-        d1 = QFrame(); d1.setObjectName("Divider")
-        outer.addWidget(d1)
 
         # Status bar
         self.status_lbl = QLabel("")
@@ -1363,14 +1512,15 @@ class MainWindow(QMainWindow):
         self.status_lbl.setStyleSheet("padding-top:4px;")
         outer.addWidget(self.status_lbl)
 
-        # Playlist
+        # Playlist section
         pl_label = QLabel("PLAYLIST  ·  drag files anywhere on the window  ·  double-click to play")
         pl_label.setObjectName("SectionLabel")
+        pl_label.setStyleSheet("padding-top:6px;")
         outer.addWidget(pl_label)
 
         pl_row = QHBoxLayout()
         self.playlist_widget = QListWidget()
-        self.playlist_widget.setMinimumHeight(140)
+        self.playlist_widget.setMinimumHeight(120)
         self.playlist_widget.itemDoubleClicked.connect(self._on_playlist_dblclick)
         pl_row.addWidget(self.playlist_widget, 1)
 
@@ -1387,8 +1537,6 @@ class MainWindow(QMainWindow):
 
         outer.addLayout(pl_row, 1)
 
-        outer.addStretch()
-
     # -------------------------------------------------------------- engine
     def _connect_engine(self):
         self.engine.position_changed.connect(self._on_position)
@@ -1397,6 +1545,8 @@ class MainWindow(QMainWindow):
         self.engine.track_loaded.connect(self._on_track_loaded)
         self.engine.track_finished.connect(self._on_track_finished)
         self.engine.error.connect(self._on_error)
+        # Worker thread → GUI thread for peaks
+        self._peaks_ready.connect(self._on_peaks_ready)
 
     # ---------------------------------------------------------- shortcuts
     def _install_shortcuts(self):
@@ -1455,6 +1605,9 @@ class MainWindow(QMainWindow):
                 first_added = len(self.playlist) - 1
         if first_added >= 0 and self.current_index < 0:
             self._load_index(first_added)
+        # Refresh prev/next enable state so they wake up as soon as the playlist
+        # reaches >1 item, even when files are added mid-playback.
+        self._update_ui_state()
 
     @staticmethod
     def _playlist_label(t: TrackInfo) -> str:
@@ -1514,22 +1667,36 @@ class MainWindow(QMainWindow):
             self.engine.play()
 
     def _on_track_finished(self):
-        # Auto-advance if there's a next track; otherwise stay idle.
-        if len(self.playlist) > 1 and self.current_index < len(self.playlist) - 1:
+        # Repeat-one: replay the same track immediately.
+        if self._repeat_mode == 1 and self.current_index >= 0:
+            self._load_index(self.current_index)
+            self.engine.play()
+            return
+        # Otherwise advance to the next track if there is one...
+        if len(self.playlist) > 0 and self.current_index < len(self.playlist) - 1:
             self.next_track()
+            self.engine.play()
+            return
+        # ...or, in repeat-all mode at the end of the list, jump back to track 0.
+        if self._repeat_mode == 2 and self.playlist:
+            self._load_index(0)
             self.engine.play()
 
     # ------------------------------------------------------- engine signals
     def _on_position(self, sec: float):
-        if self._user_seeking:
-            return
         self.waveform.set_position(sec)
         self.time_lbl.setText(f"{_fmt_time(sec)} / {_fmt_time(self.engine.duration)}")
+        # Sync the slim progress bar (block its valueChanged path; we don't
+        # need a feedback loop — it's just a passive indicator here)
         if self.engine.duration > 0:
             ratio = sec / self.engine.duration
-            self.seek_slider.blockSignals(True)
-            self.seek_slider.setValue(int(ratio * 1000))
-            self.seek_slider.blockSignals(False)
+            self.progress.blockSignals(True)
+            self.progress.setValue(int(ratio * 1000))
+            self.progress.blockSignals(False)
+
+    def _on_progress_seek(self, ratio: float):
+        if self.engine.duration > 0:
+            self.engine.seek(ratio * self.engine.duration)
 
     def _on_duration(self, dur: float):
         self.time_lbl.setText(f"{_fmt_time(self.engine.position)} / {_fmt_time(dur)}")
@@ -1565,14 +1732,24 @@ class MainWindow(QMainWindow):
         self._update_ui_state()
 
     def _compute_peaks_async(self, samples, duration):
-        if samples is None:
-            return
-        # Bigger windows = more bars; cap so we don't redraw a million bars.
-        n = max(120, min(800, self.waveform.width() // 2 if self.waveform.width() else 480))
-        peaks = compute_peaks(samples, n)
-        # Hop back to GUI thread via signal-equivalent: QTimer.singleShot
-        QTimer.singleShot(0, lambda: (self.waveform.set_loading(False),
-                                      self.waveform.set_peaks(peaks, duration)))
+        peaks = None
+        try:
+            if samples is not None:
+                w = self.waveform.width()
+                n = max(160, min(900, (w // 2) if w else 480))
+                peaks = compute_peaks(samples, n)
+        except Exception as e:
+            _log_fatal("compute_peaks failed", e)
+        # Hop back to the GUI thread via Qt's signal/slot mechanism, which
+        # routes a queued call to the main thread automatically. (Earlier
+        # we used QTimer.singleShot from the worker thread, but that could
+        # silently fail to marshal — peaks were computed but never applied.)
+        self._peaks_ready.emit(peaks, duration)
+
+    def _on_peaks_ready(self, peaks, duration: float) -> None:
+        self.waveform.set_loading(False)
+        if peaks is not None:
+            self.waveform.set_peaks(peaks, duration)
 
     def _on_error(self, msg: str):
         self.error_lbl.setText(msg)
@@ -1666,12 +1843,24 @@ class MainWindow(QMainWindow):
         self.btn_spd_plus.setEnabled(v < 2.50)
         self.btn_spd_reset.setEnabled(v != 1.0)
 
-    def _on_seek_release(self):
-        self._user_seeking = False
-        if self.engine.duration <= 0:
-            return
-        ratio = self.seek_slider.value() / 1000.0
-        self.engine.seek(ratio * self.engine.duration)
+    def _cycle_repeat(self):
+        self._repeat_mode = (self._repeat_mode + 1) % 3
+        # Update icon, tooltip, and active visual state
+        if self._repeat_mode == 0:
+            self.btn_repeat.setText("↻")
+            self.btn_repeat.setToolTip("Repeat: off (click for repeat one)")
+            self.btn_repeat.setProperty("repeatActive", False)
+        elif self._repeat_mode == 1:
+            self.btn_repeat.setText("↻¹")
+            self.btn_repeat.setToolTip("Repeat: one track (click for repeat all)")
+            self.btn_repeat.setProperty("repeatActive", True)
+        else:
+            self.btn_repeat.setText("↻")
+            self.btn_repeat.setToolTip("Repeat: whole playlist (click to turn off)")
+            self.btn_repeat.setProperty("repeatActive", True)
+        # Force QSS re-evaluation of the property selector
+        self.btn_repeat.style().unpolish(self.btn_repeat)
+        self.btn_repeat.style().polish(self.btn_repeat)
 
 
 # ============================================================================
@@ -1693,6 +1882,29 @@ def _fmt_bytes(n: int) -> str:
 # Entry point
 # ============================================================================
 
+# Single-instance plumbing: the first launch becomes the server; later launches
+# (e.g. multiple Explorer right-click invocations against the same .exe) try to
+# connect, hand over their argv, and exit. The receiver appends to the playlist
+# and brings the existing window to front.
+_SINGLE_INSTANCE_KEY = "PCMPlayer-SingleInstance-v1"
+
+
+def _try_forward_argv_to_running(args) -> bool:
+    """Return True if a running instance accepted the args and we should exit."""
+    sock = QLocalSocket()
+    sock.connectToServer(_SINGLE_INSTANCE_KEY)
+    if not sock.waitForConnected(400):
+        return False
+    try:
+        payload = json.dumps(list(args)).encode("utf-8")
+        sock.write(payload)
+        sock.flush()
+        sock.waitForBytesWritten(800)
+    finally:
+        sock.disconnectFromServer()
+    return True
+
+
 def main():
     # Make Windows show our icon in the taskbar (otherwise it groups under python.exe).
     if sys.platform == "win32":
@@ -1701,6 +1913,12 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("br.com.tributodevido.pcmplayer")
         except Exception:
             pass
+
+    # If another instance is already running, hand over our argv and exit.
+    # This is what makes multi-select context-menu invocations land in a single
+    # playlist instead of spawning many windows.
+    if _try_forward_argv_to_running(sys.argv[1:]):
+        return
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -1716,13 +1934,41 @@ def main():
     win = MainWindow()
     win.show()
 
-    # Accept files passed on the command line (file-association double-click,
-    # context-menu "Play with PCM-Player", drag-onto-shortcut, etc.).
-    # Auto-play immediately when launched this way.
-    args = sys.argv[1:]
-    files = [a for a in args if os.path.isfile(a)]
-    if files:
-        win._add_files(files)
+    # Start the local server that accepts argv hand-offs from later launches.
+    server = QLocalServer()
+    QLocalServer.removeServer(_SINGLE_INSTANCE_KEY)  # clean up any stale socket
+    server.listen(_SINGLE_INSTANCE_KEY)
+
+    def _on_new_connection():
+        s = server.nextPendingConnection()
+        if s is None:
+            return
+        if not s.waitForReadyRead(1000):
+            s.disconnectFromServer()
+            return
+        data = bytes(s.readAll()).decode("utf-8", errors="ignore")
+        s.disconnectFromServer()
+        try:
+            new_args = json.loads(data) if data else []
+        except Exception:
+            new_args = []
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        new_files = _expand_args_to_files(new_args)
+        if new_files:
+            was_idle = win.engine.state != "playing"
+            win._add_files(new_files)
+            if was_idle:
+                win.engine.play()
+
+    server.newConnection.connect(_on_new_connection)
+
+    # Accept files (and folders) passed on the command line — file-association
+    # double-click, context-menu "Play with PCM-Player", drag-onto-shortcut.
+    initial_files = _expand_args_to_files(sys.argv[1:])
+    if initial_files:
+        win._add_files(initial_files)
         win.engine.play()
 
     sys.exit(app.exec())

@@ -14,9 +14,11 @@ It quickly grew past that. What started as an MSU-1 listener turned into a full 
 - **Switchable themes** — gear icon in the header opens a picker with **Ocean** (deep blue, default), **Forest** (emerald green), **Sunset** (warm orange) and **Graphite** (black/gray); the selection is remembered in a portable `settings.json` next to the .exe (no registry, no AppData — fully portable)
 - **In-app context-menu install** — same gear menu offers a one-click "Install in Windows right-click menu" / "Remove from Windows right-click menu" toggle (auto-detects the current state, no admin required)
 - Drag-and-drop anywhere on the window — adds files to the playlist
+- **Single-instance:** opening more files while the player is already running appends to the existing playlist instead of spawning a second window
+- **Folder support:** right-clicking a folder (or inside a folder's empty area) and choosing *Play with PCM-Player* queues all audio files in that folder, sorted by name
 - **Auto-play on launch:** opening a file via association or sending one through the right-click context menu starts playback immediately
-- Click-to-seek waveform display
-- Full transport: **Play / Pause / Stop / Previous / Next**
+- **Waveform timeline:** the song shape itself is the seek bar — click anywhere on it to jump, drag to scrub, all in real time. A slim progress strip below it gives a clean linear "where am I" indicator and also accepts click-to-seek.
+- Full transport: **Play / Pause / Stop / Previous / Next / Repeat** (3-state: off → repeat one → repeat all)
 - **Real-time playback speed**: stepwise `−` / `+` buttons (0.05× per click, range 0.50× – 2.50×) plus a one-click reset to 1.00×
 - Volume slider (defaults to 100 %)
 - Animated bevel-style transport buttons with press feedback
@@ -67,7 +69,12 @@ You can register the player as a Windows Explorer right-click action so that sel
 
 **Alternative (.bat files):** if you'd rather not open the player, the repo also ships `install_context_menu.bat` / `uninstall_context_menu.bat`. Drop them next to `PCMPlayer.exe` and double-click — same end result.
 
-The verb uses `MultiSelectModel="Player"`, which tells Explorer to invoke the player **once** with all selected files as arguments — they show up as a playlist and the first one starts playing immediately.
+The install registers the verb in three places:
+- on **any file** (`*\shell`)
+- on **folders** (`Directory\shell` — right-click a folder to queue every audio file inside it)
+- on the **folder background** (`Directory\Background\shell` — right-click empty space inside an open folder, same effect)
+
+It uses `MultiSelectModel="Player"` so Explorer invokes the player **once** with all selected items, plus a single-instance guard inside the player so any extra launches that slip through still hand their files over to the running window instead of opening duplicate copies.
 
 If you move `PCMPlayer.exe` to a new location, re-install (gear menu or `.bat`) from there so the registered path stays correct.
 
