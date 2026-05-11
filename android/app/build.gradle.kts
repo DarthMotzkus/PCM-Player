@@ -50,7 +50,6 @@ dependencies {
     implementation("androidx.media3:media3-common:$media3")
     implementation("androidx.media3:media3-datasource:$media3")
     implementation("androidx.media3:media3-session:$media3")
-    implementation("androidx.media3:media3-exoplayer-midi:$media3")
 
     // Kotlin coroutines (for off-main waveform computation)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
