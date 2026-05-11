@@ -2,6 +2,8 @@
 
 A fully-compatible PCM player for raw audio files — and pretty much any audio format you throw at it.
 
+> **Looking for Android?** See [README Android.md](README%20Android.md) and the [android/](android/) folder. Starting with v2.0, every GitHub Release ships both `PCMPlayer.exe` (Windows) and `PCMPlayer-<version>.apk` (Android), built automatically by CI.
+
 ## Origin
 
 The original idea was simple: **play PCM tracks from MSU-1 SNES rom-hacks**, so I could listen to those uncompressed soundtracks outside the emulator. MSU-1 audio comes as headerless (well, near-headerless) 16-bit signed little-endian stereo PCM at 44100 Hz, and most general-purpose players just refuse to open them, or open them at the wrong sample rate.

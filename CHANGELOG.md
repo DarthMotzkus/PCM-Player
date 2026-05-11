@@ -1,3 +1,39 @@
+# PCM Player v2.0
+
+Major release: native **Android port** ships alongside the Windows desktop build, with a fully automated CI pipeline that builds both binaries and publishes them to a single GitHub Release per tag.
+
+## What's new
+
+- **Android port** (`android/`) — native app written in Kotlin + AndroidX Media3 (ExoPlayer) + Material 3:
+  - Same audio formats as desktop: WAV · FLAC · OGG/Vorbis · OPUS · AIFF · AU · MP3, plus raw PCM (`.pcm`, `.raw`, `.s8`, `.s16/le/be`, `.s24/le/be`, `.s32/le/be`, `.u8`, `.f32/le/be`, `.f64`)
+  - Raw PCM auto-detected from extension (44 100 Hz · stereo · 16-bit signed LE for `.pcm`, matching MSU-1)
+  - Four switchable themes — **Ocean** (default), **Forest**, **Sunset**, **Graphite** — same palette as desktop, persisted via `SharedPreferences`
+  - Transport: play / pause / stop / previous / next + 3-state repeat (off → one → all)
+  - Click-to-seek waveform with precomputed peaks for raw PCM
+  - Variable playback speed 0.50× – 2.50× (0.05 step), tap the readout to reset to 1.00×
+  - Playlist with auto-advance and tap-to-jump
+  - Opens audio via **Open with…**, **share/send** intents, and a built-in file picker
+- **CI/Release pipeline** (`.github/workflows/`):
+  - `build-android.yml` and `build-windows.yml` build APK + EXE on every push to `main`, uploading as artifacts
+  - `release.yml` triggers on numeric tag pushes (`2.0`, `2.1`, …) — runs both builds fresh, extracts the matching CHANGELOG section, and publishes a GitHub Release with `PCMPlayer.exe` + `PCMPlayer-<tag>.apk` attached
+  - Tag pattern is bare numeric to match the existing repo convention (no `v` prefix)
+
+## Notes
+
+- The Windows context-menu installer is desktop-only and not ported — Android uses the system **Open with…** picker instead, which the app already accepts via intent.
+- The APK is built as **debug** (debuggable, signed with the default Android debug key). Install via "Install from unknown sources" on your device. A signed release variant is a future step once a keystore is in place.
+
+## Download
+
+Grab `PCMPlayer.exe` (Windows) and `PCMPlayer-2.0.apk` (Android) from the assets below. The desktop binary is portable (no install). For Android, transfer the APK and enable "Install from unknown sources" if prompted.
+
+## Requirements
+
+- Windows 10/11 (desktop)
+- Android 7.0 / API 24+ (mobile)
+
+---
+
 # PCM Player v1.2
 
 Right-click integration overhaul, repeat modes, waveform-as-timeline with click + drag seeking, a slim progress strip below the waveform, a centered cluster of volume + speed controls, and a long list of fixes around the file-handoff path.

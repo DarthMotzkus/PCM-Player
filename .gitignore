@@ -227,3 +227,22 @@ __marimo__/
 #Others
 
 .ven
+
+# --- Android project (android/) ---
+android/.gradle/
+android/local.properties
+android/.idea/
+android/build/
+android/app/build/
+android/captures/
+android/.externalNativeBuild/
+android/.cxx/
+**/*.apk
+**/*.aab
+**/*.keystore
+
+# Source zip for the Android port (extracted into android/)
+PCMPlayerAndroid.zip
+
+# Claude Code workspace
+.claude/

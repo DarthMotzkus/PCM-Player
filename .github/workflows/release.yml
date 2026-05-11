@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  build_android:
+    uses: ./.github/workflows/build-android.yml
+
+  build_windows:
+    uses: ./.github/workflows/build-windows.yml
+
+  publish:
+    needs: [build_android, build_windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows EXE
+        uses: actions/download-artifact@v4
+        with:
+          name: PCMPlayer-windows-exe
+          path: artifacts/windows
+
+      - name: Download Android APK
+        uses: actions/download-artifact@v4
+        with:
+          name: PCMPlayer-debug-apk
+          path: artifacts/android
+
+      - name: Rename APK with version
+        run: |
+          mv artifacts/android/app-debug.apk artifacts/android/PCMPlayer-${{ github.ref_name }}.apk
+
+      - name: Extract changelog section for this tag
+        id: changelog
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, re, sys
+          tag = os.environ['TAG']
+          with open('CHANGELOG.md', encoding='utf-8') as f:
+              text = f.read()
+          pattern = rf'(^|\n)# PCM Player v{re.escape(tag)}\b(.*?)(?=\n---\n|\Z)'
+          m = re.search(pattern, text, re.DOTALL)
+          if not m:
+              print(f"::error::No section for v{tag} in CHANGELOG.md", file=sys.stderr)
+              sys.exit(1)
+          body = m.group(0).strip()
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as gh:
+              gh.write('body<<EOF\n')
+              gh.write(body + '\n')
+              gh.write('EOF\n')
+          PY
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: PCM Player v${{ github.ref_name }}
+          body: ${{ steps.changelog.outputs.body }}
+          files: |
+            artifacts/windows/PCMPlayer.exe
+            artifacts/android/PCMPlayer-${{ github.ref_name }}.apk
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
