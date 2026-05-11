@@ -3,20 +3,8 @@ name: Build Windows EXE
 on:
   push:
     branches: [ main ]
-    paths:
-      - 'pcm_player.py'
-      - 'requirements.txt'
-      - 'build_windows.bat'
-      - 'icon.ico'
-      - '.github/workflows/build-windows.yml'
   pull_request:
     branches: [ main ]
-    paths:
-      - 'pcm_player.py'
-      - 'requirements.txt'
-      - 'build_windows.bat'
-      - 'icon.ico'
-      - '.github/workflows/build-windows.yml'
   workflow_dispatch:
   workflow_call:
 
